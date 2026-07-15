@@ -39,16 +39,12 @@ DGX Spark (compute-bound prefill)  →  KV cache stream  →  Mac Studio (memory
 
 ### Software on Mac Studio
 
-- macOS 15.x+
-- [Xcode](https://developer.apple.com/xcode/) (provides the Metal ToolChain)
-- [Homebrew](https://brew.sh/): `brew install uv node`
-- [Rust](https://rustup.rs/): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && rustup toolchain install nightly`
-- [macmon](https://github.com/vladkens/macmon) (pinned fork, required on Apple M5):
-  ```bash
-  cargo install --git https://github.com/vladkens/macmon \
-    --rev a1cd06b6cc0d5e61db24fd8832e74cd992097a7d \
-    macmon --force
-  ```
+Download the latest build here: [EXO-latest.dmg](https://assets.exolabs.net/EXO-latest.dmg)
+
+You can also install the latest build with Homebrew:
+```
+brew install --cask exo
+```
 
 ### Software on DGX Spark
 
