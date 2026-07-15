@@ -145,6 +145,12 @@ This starts the exo dashboard and API at http://localhost:52415/
 - [node](https://github.com/nodejs/node) (for building the dashboard) - version 18 or higher
 - [rust](https://github.com/rust-lang/rustup) (to build Rust bindings, nightly for now)
 
+**For CUDA GPU support (Linux):**
+
+- [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) (CUDA 12.x or 13.x)
+- [NVIDIA driver](https://www.nvidia.com/drivers) with CUDA support
+- Install exo with the `mlx-cuda12` or `mlx-cuda13` extra (requires `mlx-cuda >= 0.31.2` and `numpy` for TcpRelay serialization)
+
 **Installation methods:**
 
 **Option 1: Using system package manager (Ubuntu/Debian example):**
@@ -185,13 +191,17 @@ git clone https://github.com/exo-explore/exo
 # Build dashboard
 cd exo/dashboard && npm install && npm run build && cd ..
 
-# Run exo
+# Run exo (CPU only)
 uv run exo
+
+# Run exo with CUDA GPU support (requires CUDA Toolkit + NVIDIA driver)
+uv run exo[mlx-cuda12]   # for CUDA 12.x
+uv run exo[mlx-cuda13]   # for CUDA 13.x
 ```
 
 This starts the exo dashboard and API at http://localhost:52415/
 
-**Important note for Linux users:** Currently, exo runs on CPU on Linux. GPU support for Linux platforms is under development. If you'd like to see support for your specific Linux hardware, please [search for existing feature requests](https://github.com/exo-explore/exo/issues) or create a new one.
+**Linux GPU support:** exo now supports native CUDA GPU inference on Linux with automatic heterogeneous cluster coordination (e.g., mixing Metal macOS nodes with CUDA Linux nodes in a single cluster). The TcpRelay component provides reliable tensor serialization between CUDA devices using numpy.
 
 **Configuration Options:**
 
@@ -578,7 +588,15 @@ The tool outputs performance metrics including prompt tokens per second (prompt_
 
 ## Hardware Accelerator Support
 
-On macOS, exo uses the GPU. On Linux, exo currently runs on CPU. We are working on extending hardware accelerator support. If you'd like support for a new hardware platform, please [search for an existing feature request](https://github.com/exo-explore/exo/issues) and add a thumbs up so we know what hardware is important to the community.
+On macOS, exo uses the GPU (Metal). On Linux, exo supports both CPU and CUDA GPU inference. Heterogeneous clusters mixing Metal and CUDA devices are supported with automatic topology-aware scheduling.
+
+| Platform | Accelerator | Backend |
+|----------|-------------|---------|
+| macOS | Metal GPU | MLX Metal |
+| Linux | CPU | MLX CPU |
+| Linux | NVIDIA CUDA GPU | MLX CUDA + TcpRelay |
+
+If you'd like support for a new hardware platform, please [search for an existing feature request](https://github.com/exo-explore/exo/issues) and add a thumbs up so we know what hardware is important to the community.
 
 ---
 
