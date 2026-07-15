@@ -39,19 +39,22 @@ DGX Spark (compute-bound prefill)  →  KV cache stream  →  Mac Studio (memory
 
 ### Software on Mac Studio
 
-Download the latest build here: [EXO-latest.dmg](https://assets.exolabs.net/EXO-latest.dmg)
-
-You can also install the latest build with Homebrew:
-```
-brew install --cask exo
-```
+- macOS 15.x+
+- [Xcode](https://developer.apple.com/xcode/) (provides the Metal ToolChain)
+- [Homebrew](https://brew.sh/): `brew install uv node`
+- [Rust](https://rustup.rs/): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && rustup toolchain install nightly`
+- [macmon](https://github.com/vladkens/macmon) (pinned fork, required on Apple M5):
+  ```bash
+  cargo install --git https://github.com/vladkens/macmon \
+    --rev a1cd06b6cc0d5e61db24fd8832e74cd992097a7d \
+    macmon --force
+  ```
 
 ### Software on DGX Spark
 
 - Ubuntu 24.04
 - NVIDIA driver with CUDA 13.0 support
 - Docker and Docker Compose
-- The `exo:cuda13` Docker image (built from this repo — see [Setup](#4-setting-up-the-dgx-spark-node))
 
 ### Namespace
 
@@ -61,8 +64,11 @@ Both nodes must share the same `--namespace` (default is the exo version string 
 
 ## 1. Setting Up the Mac Studio Node
 
+Clone our fork and build the dashboard:
+
 ```bash
-cd ~/exo
+git clone https://github.com/audiohacking/exo.git
+cd exo
 
 # Build the dashboard (one-time)
 cd dashboard && npm install && npm run build && cd ..
@@ -92,22 +98,38 @@ The node detects its backends as `[MlxCpu, MlxMetal]`.
 
 ## 2. Setting Up the DGX Spark Node
 
-### Build the Docker image
+### Clone our fork
 
-On the DGX Spark, clone the repo and build the CUDA container:
+On the DGX Spark, clone our fork (not the upstream repo) and switch to the branch with CUDA support:
 
 ```bash
-git clone https://github.com/exo-explore/exo
+git clone https://github.com/audiohacking/exo.git
 cd exo
+git checkout feature/linux-cuda-support
+```
 
-# Build the CUDA 13 image
+### Build the Docker image
+
+Build the `exo:cuda13` image from our local code:
+
+```bash
 docker compose build
 ```
 
-The multi-stage Dockerfile builds:
-1. **Rust builder** — compiles the `exo_rs` PyO3 wheel with maturin
-2. **Dashboard builder** — compiles the Svelte frontend
-3. **Runtime** — installs Python 3.13, syncs deps with `--extra mlx-cuda13`, installs the prebuilt wheel
+The multi-stage `docker/Dockerfile` builds from our source:
+
+1. **Rust builder** (`nvidia/cuda:13.0.2-devel-ubuntu24.04`) — installs Rust nightly + maturin, copies `Cargo.toml`, `Cargo.lock`, and Rust source, then builds the `exo_rs` PyO3 wheel
+2. **Dashboard builder** (`node:22-slim`) — copies `dashboard/package.json` and `dashboard/`, runs `npm ci` + `npm run build`
+3. **Runtime** (`nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04`) — installs Python 3.13 + uv, copies `pyproject.toml`, `uv.lock`, `src/`, and `resources/`, creates a venv, runs `uv sync --extra mlx-cuda13 --no-install-project --no-install-workspace`, installs the prebuilt Rust wheel, then installs the Python package with `uv pip install . --no-deps`. Also ships an MLX CUDA compat shim (`mlx_cuda_compat.py`) that maps `mx.new_stream` to `mx.new_thread_local_stream` for MLX-LM compatibility
+
+Key dependencies installed:
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `mlx-cuda-13` | 0.32.0 | MLX CUDA backend for Linux ARM64 |
+| `mlx` | 0.32.0 | MLX core (from custom fork with JACCL fixes) |
+| `numpy` | (latest) | TcpRelay tensor serialization |
+| `torch` | 2.10.0 (cu130) | PyTorch CUDA 13.0 backend |
 
 ### Run the container
 
@@ -119,9 +141,9 @@ The `docker-compose.yml` config:
 
 | Setting | Purpose |
 |---------|---------|
-| `network_mode: host` | Shares the host network so zenoh discovery and TcpRelay ports work |
+| `network_mode: host` | Shares the host network so zenoh discovery and TcpRelay ports work directly |
 | `deploy.resources.reservations.devices` | Exposes the GPU via the NVIDIA Container Toolkit |
-| Volume mounts | Maps `~/.local/share/exo`, `~/.cache/exo`, `~/.config/exo`, `~/.cache/huggingface` |
+| Volume mounts | Maps `~/.local/share/exo`, `~/.cache/exo`, `~/.config/exo`, `~/.cache/huggingface` into the container |
 
 **Verify:** Check the logs for:
 
@@ -255,10 +277,14 @@ Each node calls `mx.distributed.init(backend="ring", strict=True)` to form the M
 
 On the DGX Spark, the `TcpRelay` component handles CUDA-to-CUDA communication:
 
-- Started eagerly during distributed init
+- Started eagerly during distributed init (see `src/exo/worker/engines/mlx/utils_mlx.py`)
 - Listens on port `40000 + rank`
-- Routes CUDA-to-CUDA send/recv through raw TCP sockets (bypassing the broken MLX ring send/recv for CUDA)
+- Routes CUDA-to-CUDA send/recv through raw TCP sockets (bypassing the broken MLX ring send/recv for CUDA aarch64)
 - Metal-to-CUDA operations use the standard MLX ring backend
+
+### Layer allocation
+
+For a 2-node pipeline, layers are split proportionally to available RAM via `allocate_layers_proportionally()` in `src/exo/master/placement_utils.py`. The DGX Spark (128 GB) may get more layers than the Mac Studio depending on available memory. The DGX Spark handles prefill (computing KV caches for the prompt), then streams them layer-by-layer to the Mac Studio for decode (token-by-token generation).
 
 ---
 
