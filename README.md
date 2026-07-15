@@ -600,6 +600,12 @@ If you'd like support for a new hardware platform, please [search for an existin
 
 ---
 
+## Guides
+
+- **[Heterogeneous Cluster: Mac Studio + DGX Spark](docs/heterogeneous-cluster.md)** — Step-by-step guide for combining a Mac Studio (Metal GPU) and NVIDIA DGX Spark (CUDA GPU) into a single cluster for 2.8× faster inference.
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to exo.
