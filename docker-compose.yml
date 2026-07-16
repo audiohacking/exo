@@ -31,5 +31,10 @@ services:
       # Streams each layer's KV cache out as it's computed instead of waiting for the
       # whole prefill to finish. Only affects prefill-server instances (Instance Links).
       - EXO_STREAMING_PREFILL=1
+      # NOTE: EXO_REMOTE_PREFILL_MIN_TOKENS gates whether a *decode* node bothers
+      # calling out to a linked prefill node at all (default 1000 uncached tokens).
+      # That decision happens on whichever node is running the decode instance — set
+      # it there (e.g. on the Mac: EXO_REMOTE_PREFILL_MIN_TOKENS=50 uv run exo), not
+      # here, unless this node is itself acting as a decode target.
     stdin_open: true
     tty: true

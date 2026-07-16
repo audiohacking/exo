@@ -32,7 +32,11 @@ from exo.worker.engines.mlx.cache import (
     encode_prompt,
     make_kv_cache,
 )
-from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
+from exo.worker.engines.mlx.constants import (
+    DEFAULT_TOP_LOGPROBS,
+    MAX_TOKENS,
+    REMOTE_PREFILL_MIN_TOKENS,
+)
 from exo.worker.engines.mlx.generator.generate import (
     ban_token_ids,
     eos_ids_from_tokenizer,
@@ -59,7 +63,6 @@ from exo.worker.engines.mlx.vision import (
 from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
-REMOTE_PREFILL_MIN_TOKENS = 1000
 
 
 def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:

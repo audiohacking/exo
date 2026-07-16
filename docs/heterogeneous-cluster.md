@@ -211,11 +211,12 @@ no UI option for Instance Links yet. Use the setup script or the API directly.
 |----------|-------|---------|
 | `ENABLE_DISAGGREGATION=true` | **Both nodes** | Without this, every `/v1/instance-links` endpoint 404s. |
 | `EXO_STREAMING_PREFILL=1` | **Prefill node** (DGX Spark) | Enables layer-by-layer KV streaming during prefill. Without it, disaggregated prefill still works but falls back to computing the whole prefill before sending anything — no compute/network overlap. |
+| `EXO_REMOTE_PREFILL_MIN_TOKENS` | **Decode node** (Mac Studio) | **Read this even if you skip everything else below.** Default `1000`. The decode node only calls out to the linked prefill node if the *uncached* portion of the prompt exceeds this many tokens — below it, the decode node just runs prefill itself and the prefill node is never contacted at all. Lower it for testing with short prompts, e.g. `EXO_REMOTE_PREFILL_MIN_TOKENS=50 uv run exo`. |
 
-Both are already set in `docker-compose.yml` for the DGX container. On the Mac, export
-them before `uv run exo` (`ENABLE_DISAGGREGATION=true uv run exo` — `EXO_STREAMING_PREFILL`
-only matters on whichever node acts as the prefill server, so it's not needed on the Mac
-when the Mac is the decode node).
+`ENABLE_DISAGGREGATION` and `EXO_STREAMING_PREFILL` are already set in `docker-compose.yml`
+for the DGX container. On the Mac, export the ones relevant to whichever role it's
+playing before `uv run exo` — `EXO_STREAMING_PREFILL` only matters on the prefill node,
+`EXO_REMOTE_PREFILL_MIN_TOKENS` only matters on the decode node.
 
 ### Option A: automated setup script (recommended)
 
@@ -292,21 +293,44 @@ responses come back camelCase (`shardAssignments`, `nodeToRunner`, `prefillInsta
 Always copy the `.instance` object from a preview verbatim into the create call rather
 than hand-writing it.
 
-### Verifying streaming is actually active
+### Why "nothing reaches the DGX" is the expected result for short prompts
 
-`EXO_STREAMING_PREFILL=1` being set doesn't guarantee every layer streams early — an
-unsupported layer/cache shape silently falls back to the final flush (still correct,
-just without the overlap benefit for that layer). To confirm real streaming:
+The single most common confusion testing this: everything looks correctly linked (the
+`/advanced` page shows the route, the setup script succeeds, chat works), but 100% of
+processing visibly happens on the Mac and the DGX is never touched. **This is not a
+routing bug** — the master correctly excludes prefill-only instances from ordinary
+generation dispatch. It's the `EXO_REMOTE_PREFILL_MIN_TOKENS` gate above: short chat
+messages (a sentence or two) never have more than a handful of uncached tokens, so
+`use_remote` (`src/exo/worker/engines/mlx/generator/generate.py`,
+`.../batch_generate.py`) evaluates `False` and the decode node just runs prefill itself
+— the prefill node is never even contacted, let alone streamed to.
 
-- Tail the **prefill node's** logs during a request with a long-ish prompt (short
-  prompts finish before there's much to observe). You should see multiple `KVChunk`
-  sends interleaved with prefill progress, not one burst at the very end.
-- If `_StreamingKVLayer`'s defensive catch fires for a layer, it logs at `debug` level:
-  `"Streaming prefill: layer N hook failed, will fall back to non-streamed send"` —
-  run with `-vv` to see these.
-- Compare total request latency with `EXO_STREAMING_PREFILL` unset vs `=1` for the same
-  prompt — streaming should win once the prompt is long enough that DGX compute time and
-  KV transfer time are both significant (short prompts won't show much difference).
+This also means `scripts/setup_disaggregated_cluster.py --test`'s own built-in test
+prompt ("Say hello in exactly 5 words", ~18 tokens) **only validates that instance
+creation, pinning, and linking work — it never exercises the actual remote-prefill data
+path.** A successful `--test` run proves the plumbing is correct, not that DGX did any
+work.
+
+To actually trigger and observe the remote path:
+
+1. Either paste a long document/article as the prompt (comfortably over 1000
+   uncached tokens), or lower the threshold for testing:
+   `EXO_REMOTE_PREFILL_MIN_TOKENS=50 uv run exo` on the Mac (decode node).
+2. Send a **fresh, unique** long prompt each time — repeating a similar prompt lets the
+   Mac's own local `KVPrefixCache` absorb more of it on each attempt, shrinking the
+   uncached count and making it progressively *less* likely to cross the threshold.
+3. Tail the **prefill node's** logs during that request. You should see multiple
+   `KVChunk` sends interleaved with prefill progress, not one burst at the very end
+   (that's `EXO_STREAMING_PREFILL` actually doing something).
+4. If `_StreamingKVLayer`'s defensive catch fires for a layer, it logs at `debug` level:
+   `"Streaming prefill: layer N hook failed, will fall back to non-streamed send"` —
+   run with `-vv` to see these.
+5. Also watch the **decode node's** logs for `"Remote prefill failed, falling back to
+   local prefill"` — a silent exception in the remote path looks identical to "never
+   crossed the threshold" unless you're watching for it.
+6. Compare total request latency with `EXO_STREAMING_PREFILL` unset vs `=1` for the same
+   long prompt — streaming should win once DGX compute time and KV transfer time are
+   both significant.
 
 ---
 
@@ -557,6 +581,7 @@ For a 2-node pipeline, layers are split proportionally to available RAM via `all
 | `EXO_OFFLINE` | Skip internet checks (`true`/`false`) |
 | `ENABLE_DISAGGREGATION` | Enables `/v1/instance-links` (prefill/decode disaggregation) — required on both nodes for section 4 |
 | `EXO_STREAMING_PREFILL` | Enables layer-by-layer KV streaming during prefill — set on the prefill node only |
+| `EXO_REMOTE_PREFILL_MIN_TOKENS` | Uncached-token threshold before the decode node bothers calling the linked prefill node (default `1000`) — set on the decode node only |
 | `MLX_HOSTS_JSON` | MLX ring host configuration (set automatically) |
 | `MLX_RANK` | MLX distributed rank (set automatically) |
 | `MLX_CUDA_RANKS` | Comma-separated CUDA ranks (set automatically) |

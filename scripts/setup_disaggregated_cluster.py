@@ -200,16 +200,31 @@ async def ensure_link(
     print(f"  Created link (command_id={resp.get('command_id')})")
 
 
+# The decode node only calls out to the linked prefill node if the uncached prompt
+# exceeds EXO_REMOTE_PREFILL_MIN_TOKENS (default 1000, set on the decode node). A short
+# test prompt "succeeding" only proves instance creation/linking works — it never
+# touches the prefill node at all. This filler is long enough to comfortably clear the
+# default threshold so --test actually exercises the remote-prefill data path.
+_LONG_TEST_PROMPT = (
+    "Summarize the key engineering tradeoffs of disaggregating LLM inference into "
+    "separate prefill and decode stages across heterogeneous hardware. "
+) * 60
+
+
 async def test_chat_completion(
     client: httpx.AsyncClient, api: str, model_id: str
 ) -> None:
-    print("\nSending test chat completion...")
+    print(
+        "\nSending test chat completion (long prompt, to actually cross "
+        "EXO_REMOTE_PREFILL_MIN_TOKENS and exercise the remote-prefill path — "
+        "a short prompt would silently run entirely on the decode node)..."
+    )
     async with client.stream(
         "POST",
         f"{api}/v1/chat/completions",
         json={
             "model": model_id,
-            "messages": [{"role": "user", "content": "Say hello in exactly 5 words."}],
+            "messages": [{"role": "user", "content": _LONG_TEST_PROMPT}],
             "stream": True,
         },
         timeout=120.0,
