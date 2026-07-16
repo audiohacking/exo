@@ -1,4 +1,5 @@
 import time
+from collections.abc import Callable
 
 import mlx.core as mx
 from mlx_lm.sample_utils import make_sampler
@@ -11,10 +12,24 @@ from exo.worker.engines.mlx.cache import (
     make_kv_cache,
     snapshot_ssm_states,
 )
+from exo.worker.engines.mlx.disaggregated.streaming_prefill import (
+    StreamingPrefillLayers,
+)
 from exo.worker.engines.mlx.generator.generate import prefill as mlx_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import fix_unmatched_think_end_tokens
 from exo.worker.runner.bootstrap import logger
+
+
+def compute_target_offset(n_tokens: int) -> int:
+    """The final cache offset a prefill request should reach.
+
+    stream_generate always produces one extra generated token beyond the prompt (and
+    prefill trims one more to leave room to resume generation), so the cache's usable
+    offset is n_tokens - 2, never negative. Exposed so callers streaming KV chunks out
+    incrementally can clamp to the same bound serve.py itself trims to.
+    """
+    return max(0, n_tokens - 2)
 
 
 def run_prefill_for_request(
@@ -24,6 +39,7 @@ def run_prefill_for_request(
     group: mx.distributed.Group | None,
     kv_prefix_cache: KVPrefixCache | None,
     request: PrefillRequest,
+    on_layer_ready: Callable[[int, KVCacheType], None] | None = None,
 ) -> KVCacheType:
     prompt_tokens = mx.array(request.token_ids)
     prompt_tokens = fix_unmatched_think_end_tokens(prompt_tokens, tokenizer)
@@ -41,21 +57,31 @@ def run_prefill_for_request(
         cache = make_kv_cache(model)
         remaining = prompt_tokens
 
-    target_offset = max(0, n_tokens - 2)
+    target_offset = compute_target_offset(n_tokens)
     new_tokens = max(0, target_offset - prefix_hit_length)
     prefill_input = remaining[:new_tokens]
     if int(prefill_input.shape[0]) > 0:
         sampler = make_sampler(temp=1.0)
-        _ = mlx_prefill(
-            model=model,
-            tokenizer=tokenizer,
-            sampler=sampler,
-            prompt_tokens=prefill_input,
-            cache=cache,
-            group=group,
-            on_prefill_progress=None,
-            distributed_prompt_progress_callback=None,
-        )
+
+        def _do_prefill() -> None:
+            _ = mlx_prefill(
+                model=model,
+                tokenizer=tokenizer,
+                sampler=sampler,
+                prompt_tokens=prefill_input,
+                cache=cache,
+                group=group,
+                on_prefill_progress=None,
+                distributed_prompt_progress_callback=None,
+            )
+
+        if on_layer_ready is not None:
+            with StreamingPrefillLayers(
+                model, lambda layer_idx: on_layer_ready(layer_idx, cache)
+            ):
+                _do_prefill()
+        else:
+            _do_prefill()
 
     if kv_prefix_cache is not None:
         try:

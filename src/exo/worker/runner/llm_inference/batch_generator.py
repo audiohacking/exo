@@ -1,11 +1,21 @@
 import itertools
+import os
 import time
 from collections import deque
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
 import mlx.core as mx
+from mlx_lm.models.cache import (
+    ArraysCache,
+    CacheList,
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+)
+from mlx_lm.models.deepseek_v4 import DeepseekV4Cache
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.constants import EXO_MAX_CONCURRENT_REQUESTS
@@ -25,18 +35,33 @@ from exo.shared.types.worker.runner_response import (
     GenerationResponse,
 )
 from exo.utils.channels import MpReceiver, MpSender
+from exo.worker.disaggregated.protocol import (
+    DType,
+    Header,
+    write_done,
+    write_header,
+    write_message,
+)
 from exo.worker.disaggregated.server import PrefillRequest
 from exo.worker.engines.base import Engine
-from exo.worker.engines.mlx.cache import KVPrefixCache
-from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
-from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
+from exo.worker.engines.mlx.cache import KVPrefixCache, cache_length
+from exo.worker.engines.mlx.disaggregated.adapter import (
+    build_kv_chunk_for_entry,
+    send_arrays_cache_entry,
+    wire_dtype_from_cache,
+    write_cache_to_wire,
+)
+from exo.worker.engines.mlx.disaggregated.serve import (
+    compute_target_offset,
+    run_prefill_for_request,
+)
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
     mlx_generate,
     warmup_inference,
 )
-from exo.worker.engines.mlx.types import Model
+from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     mx_all_gather_tasks,
@@ -47,6 +72,176 @@ from exo.worker.runner.bootstrap import logger
 
 from .model_output_parsers import apply_all_parsers, map_responses_to_chunks
 from .tool_parsers import ToolParser
+
+# Bounds how many chunk sends can be queued to the background writer thread before the
+# prefill forward pass blocks waiting for one to finish. Keeps memory bounded for very
+# long prompts and gives natural backpressure if the network is the bottleneck.
+_STREAMING_PREFILL_MAX_INFLIGHT = 2
+
+
+def _streaming_prefill_enabled() -> bool:
+    return os.getenv("EXO_STREAMING_PREFILL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _serve_prefill_streaming(
+    *,
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    group: mx.distributed.Group | None,
+    kv_prefix_cache: KVPrefixCache | None,
+    request: PrefillRequest,
+    wfile: BinaryIO,
+) -> None:
+    """Stream each layer's KV cache slice out as soon as it's computed, instead of
+    waiting for the whole prefill to finish (the default, EXO_STREAMING_PREFILL=1
+    behavior). Overlaps DGX-side compute with the network transfer to the decode node.
+
+    Falls back to a final flush pass over every layer after prefill completes, so
+    correctness never depends on the per-layer hook firing for every layer (e.g. an
+    unsupported layer/cache shape, or a full prefix-cache hit with nothing to prefill
+    at all, degrade gracefully to a single bulk-style send at the end).
+    """
+    target_offset = compute_target_offset(len(request.token_ids))
+    last_sent: dict[int, int] = {}
+    sent_arrays: set[int] = set()
+    header_written = False
+    pending: deque[Future[None]] = deque()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefill-send")
+
+    def _drain_one() -> None:
+        pending.popleft().result()
+
+    def _submit(fn: Callable[[], None]) -> None:
+        if len(pending) >= _STREAMING_PREFILL_MAX_INFLIGHT:
+            _drain_one()
+        pending.append(executor.submit(fn))
+
+    def _ensure_header(cache: KVCacheType, dtype: DType) -> None:
+        nonlocal header_written
+        if header_written:
+            return
+        write_header(
+            wfile,
+            Header(
+                request_id=request.request_id,
+                model_id=request.model_id,
+                num_layers=len(cache),
+                dtype=dtype,
+                start_pos=request.start_pos,
+            ),
+        )
+        header_written = True
+
+    def _send_layer(layer_idx: int, cache: KVCacheType) -> None:
+        entry = cache[layer_idx]
+        match entry:
+            case QuantizedKVCache() | CacheList() | DeepseekV4Cache():
+                raise NotImplementedError
+            case ArraysCache():
+                if layer_idx in sent_arrays:
+                    return
+                sent_arrays.add(layer_idx)
+                _ensure_header(cache, wire_dtype_from_cache(cache))
+
+                def _write_arrays() -> None:
+                    send_arrays_cache_entry(wfile, entry, layer_idx)
+                    wfile.flush()
+
+                _submit(_write_arrays)
+            case KVCache() | RotatingKVCache():
+                start = last_sent.get(layer_idx, request.start_pos)
+                chunk = build_kv_chunk_for_entry(
+                    entry,
+                    layer_idx,
+                    dtype=wire_dtype_from_cache(cache),
+                    start_pos=start,
+                    max_tokens=target_offset,
+                )
+                if chunk is None:
+                    return
+                _ensure_header(cache, chunk.dtype)
+                last_sent[layer_idx] = start + chunk.num_tokens
+
+                def _write_chunk() -> None:
+                    write_message(wfile, chunk)
+                    wfile.flush()
+
+                _submit(_write_chunk)
+
+    def _on_layer_ready(layer_idx: int, cache: KVCacheType) -> None:
+        try:
+            _send_layer(layer_idx, cache)
+        except Exception as e:
+            logger.opt(exception=e).warning(
+                f"Streaming prefill: failed to send layer {layer_idx} incrementally "
+                f"for request_id={request.request_id}, will retry in final flush"
+            )
+
+    try:
+        cache = run_prefill_for_request(
+            model=model,
+            tokenizer=tokenizer,
+            group=group,
+            kv_prefix_cache=kv_prefix_cache,
+            request=request,
+            on_layer_ready=_on_layer_ready,
+        )
+
+        for layer_idx in range(len(cache)):
+            _send_layer(layer_idx, cache)
+
+        while pending:
+            _drain_one()
+
+        # Only reached if nothing streamed and the final flush had nothing to send
+        # either (e.g. a full prefix-cache hit — client already has everything).
+        _ensure_header(cache, wire_dtype_from_cache(cache))
+        total_tokens = max(
+            0, min(cache_length(cache), target_offset) - request.start_pos
+        )
+        write_done(wfile, total_tokens)
+        wfile.flush()
+    finally:
+        executor.shutdown(wait=True)
+
+
+def _serve_prefill(
+    *,
+    model: Model,
+    tokenizer: TokenizerWrapper,
+    group: mx.distributed.Group | None,
+    kv_prefix_cache: KVPrefixCache | None,
+    request: PrefillRequest,
+    wfile: BinaryIO,
+) -> None:
+    if _streaming_prefill_enabled():
+        _serve_prefill_streaming(
+            model=model,
+            tokenizer=tokenizer,
+            group=group,
+            kv_prefix_cache=kv_prefix_cache,
+            request=request,
+            wfile=wfile,
+        )
+        return
+    cache = run_prefill_for_request(
+        model=model,
+        tokenizer=tokenizer,
+        group=group,
+        kv_prefix_cache=kv_prefix_cache,
+        request=request,
+    )
+    write_cache_to_wire(
+        wfile,
+        cache,
+        request_id=request.request_id,
+        model_id=request.model_id,
+        start_pos=request.start_pos,
+    )
 
 
 class GeneratorQueue[T]:
@@ -301,19 +496,13 @@ class SequentialGenerator(Engine):
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
-        cache = run_prefill_for_request(
+        _serve_prefill(
             model=self.model,
             tokenizer=self.tokenizer,
             group=self.group,
             kv_prefix_cache=self.kv_prefix_cache,
             request=request,
-        )
-        write_cache_to_wire(
-            wfile,
-            cache,
-            request_id=request.request_id,
-            model_id=request.model_id,
-            start_pos=request.start_pos,
+            wfile=wfile,
         )
 
 
@@ -556,17 +745,11 @@ class BatchGenerator(Engine):
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
-        cache = run_prefill_for_request(
+        _serve_prefill(
             model=self.model,
             tokenizer=self.tokenizer,
             group=self.group,
             kv_prefix_cache=self.kv_prefix_cache,
             request=request,
-        )
-        write_cache_to_wire(
-            wfile,
-            cache,
-            request_id=request.request_id,
-            model_id=request.model_id,
-            start_pos=request.start_pos,
+            wfile=wfile,
         )

@@ -25,5 +25,10 @@ services:
       # Cluster namespace — must match the Mac node
       - EXO_ZENOH_NAMESPACE=qxip-cluster
       # - EXO_LIBP2P_NAMESPACE=qxip
+      # Disaggregated prefill: stream each layer's KV cache out as it's computed
+      # instead of waiting for the whole prefill to finish. Only affects prefill-server
+      # instances (Instance Links); uncomment to enable, unset to keep today's
+      # send-everything-at-the-end behavior.
+      # - EXO_STREAMING_PREFILL=1
     stdin_open: true
     tty: true

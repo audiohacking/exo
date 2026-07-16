@@ -19,7 +19,7 @@ from exo.worker.disaggregated.protocol import (
     write_arrays_state,
     write_done,
     write_header,
-    write_kv_chunk,
+    write_message,
 )
 from exo.worker.engines.mlx.types import KVCacheType
 from exo.worker.runner.bootstrap import logger
@@ -90,6 +90,71 @@ def nhd_to_bhsd(t: mx.array) -> mx.array:
     return mx.expand_dims(mx.transpose(t, (1, 0, 2)), 0)
 
 
+def build_kv_chunk_for_entry(
+    c: KVCache | RotatingKVCache,
+    layer_idx: int,
+    *,
+    dtype: DType,
+    start_pos: int = 0,
+    max_tokens: int | None = None,
+) -> KVChunk | None:
+    """Materialize a single layer's new KV slice (`[start_pos:offset]`) as a wire-ready
+    KVChunk, or None if there's nothing new beyond start_pos.
+
+    Split out from send_mlx_kv_cache so callers that want to overlap network I/O with
+    ongoing compute (streaming prefill) can do the MLX-side eval/serialize on the calling
+    thread and hand the already-materialized struct off to a writer thread — MLX ops must
+    not be issued from a background thread.
+    """
+    keys = c.keys
+    values = c.values
+    if keys is None or values is None:
+        return None
+    offset = int(c.offset)
+    if max_tokens is not None:
+        offset = min(offset, max_tokens)
+    if offset <= start_pos:
+        return None
+    with mx.stream(mx.Device(mx.cpu)):
+        k = mx.array(keys[:, :, start_pos:offset, :])
+        v = mx.array(values[:, :, start_pos:offset, :])
+        k_nhd = bhsd_to_nhd(k)
+        v_nhd = bhsd_to_nhd(v)
+        mx.eval(k_nhd, v_nhd)
+    return KVChunk(
+        layer_idx=layer_idx,
+        num_tokens=int(k_nhd.shape[0]),
+        n_heads=int(k_nhd.shape[1]),
+        head_dim=int(k_nhd.shape[2]),
+        dtype=dtype,
+        keys=array_to_bytes(k_nhd),
+        values=array_to_bytes(v_nhd),
+    )
+
+
+def send_arrays_cache_entry(stream: BinaryIO, c: ArraysCache, layer_idx: int) -> None:
+    """Send an ArraysCache entry's full state snapshot (SSM/hybrid-model layers, which
+    don't have an incrementally-growing KV offset the way attention layers do — there's
+    nothing to slice by start_pos, the whole state is sent each time this is called).
+    """
+    blobs: list[TensorBlob] = []
+    for a in c.state:
+        if a is None:
+            continue
+        with mx.stream(mx.Device(mx.cpu)):
+            a_cpu = mx.array(a)
+            mx.eval(a_cpu)
+        blobs.append(
+            TensorBlob(
+                dtype=mx_dtype_to_str(a_cpu.dtype),
+                shape=tuple(int(d) for d in a_cpu.shape),
+                data=array_to_bytes(a_cpu),
+            )
+        )
+    if blobs:
+        write_arrays_state(stream, layer_idx, blobs)
+
+
 def send_mlx_kv_cache(
     stream: BinaryIO,
     caches: KVCacheType,
@@ -104,56 +169,23 @@ def send_mlx_kv_cache(
             case QuantizedKVCache() | CacheList() | DeepseekV4Cache():
                 raise NotImplementedError
             case KVCache() | RotatingKVCache():
-                keys = c.keys
-                values = c.values
-                if keys is None or values is None:
-                    continue
-                offset = int(c.offset)
-                if max_tokens is not None:
-                    offset = min(offset, max_tokens)
-                if offset <= start_pos:
-                    continue
-                with mx.stream(mx.Device(mx.cpu)):
-                    k = mx.array(keys[:, :, start_pos:offset, :])
-                    v = mx.array(values[:, :, start_pos:offset, :])
-                    k_nhd = bhsd_to_nhd(k)
-                    v_nhd = bhsd_to_nhd(v)
-                    mx.eval(k_nhd, v_nhd)
-                num_tokens = int(k_nhd.shape[0])
-                n_heads = int(k_nhd.shape[1])
-                head_dim = int(k_nhd.shape[2])
-                write_kv_chunk(
-                    stream,
-                    layer_idx=layer_idx,
-                    num_tokens=num_tokens,
-                    n_heads=n_heads,
-                    head_dim=head_dim,
+                chunk = build_kv_chunk_for_entry(
+                    c,
+                    layer_idx,
                     dtype=dtype,
-                    keys=array_to_bytes(k_nhd),
-                    values=array_to_bytes(v_nhd),
+                    start_pos=start_pos,
+                    max_tokens=max_tokens,
                 )
-                if tokens_sent != 0 and num_tokens != tokens_sent:
+                if chunk is None:
+                    continue
+                write_message(stream, chunk)
+                if tokens_sent != 0 and chunk.num_tokens != tokens_sent:
                     logger.critical(
-                        f"Unexpected number of tokens sent {num_tokens} != {tokens_sent}"
+                        f"Unexpected number of tokens sent {chunk.num_tokens} != {tokens_sent}"
                     )
-                tokens_sent = num_tokens
+                tokens_sent = chunk.num_tokens
             case ArraysCache():
-                blobs: list[TensorBlob] = []
-                for a in c.state:
-                    if a is None:
-                        continue
-                    with mx.stream(mx.Device(mx.cpu)):
-                        a_cpu = mx.array(a)
-                        mx.eval(a_cpu)
-                    blobs.append(
-                        TensorBlob(
-                            dtype=mx_dtype_to_str(a_cpu.dtype),
-                            shape=tuple(int(d) for d in a_cpu.shape),
-                            data=array_to_bytes(a_cpu),
-                        )
-                    )
-                if blobs:
-                    write_arrays_state(stream, layer_idx, blobs)
+                send_arrays_cache_entry(stream, c, layer_idx)
     return tokens_sent
 
 
