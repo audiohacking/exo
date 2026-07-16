@@ -32,6 +32,7 @@ from exo.utils.pydantic_ext import TaggedModel
 from exo.utils.task_group import TaskGroup
 
 from .macmon import MacmonMetrics
+from .nvml import NvmlMetrics
 from .system_info import (
     get_friendly_name,
     get_model_and_chip,
@@ -385,6 +386,7 @@ class NodeBackends(TaggedModel):
 
 GatheredInfo = (
     MacmonMetrics
+    | NvmlMetrics
     | MemoryUsage
     | NodeNetworkInterfaces
     | MacThunderboltIdentifiers
@@ -450,6 +452,8 @@ class InfoGatherer:
                 tg.start_soon(self._monitor_rdma_ctl_status, 10)
             if not IS_DARWIN:
                 tg.start_soon(self._monitor_memory_usage, 1)
+                if await to_thread.run_sync(_has_nvml_cuda):
+                    tg.start_soon(self._monitor_nvml, 1)
             tg.start_soon(self._watch_system_info, 10)
             tg.start_soon(self._monitor_misc, 60)
             tg.start_soon(self._monitor_static_info, 60)
@@ -570,6 +574,17 @@ class InfoGatherer:
             except Exception as e:
                 logger.opt(exception=e).warning("Error gathering disk usage")
             await anyio.sleep(disk_poll_interval)
+
+    async def _monitor_nvml(self, nvml_interval: float):
+        while True:
+            try:
+                with fail_after(10):
+                    metrics = await to_thread.run_sync(NvmlMetrics.gather)
+                if metrics is not None:
+                    await self.info_sender.send(metrics)
+            except Exception as e:
+                logger.opt(exception=e).warning("Error gathering NVML metrics")
+            await anyio.sleep(nvml_interval)
 
     async def _monitor_macmon(self, macmon_interval: float):
         if (
