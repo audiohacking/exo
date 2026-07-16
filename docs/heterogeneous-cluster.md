@@ -191,7 +191,133 @@ Open `http://localhost:52415/` on either node. The cluster view should show both
 
 ---
 
-## 4. Running a Model
+## 4. Running Disaggregated Prefill/Decode (Recommended)
+
+The Architecture section above describes DGX-does-prefill / Mac-does-decode with
+layer-by-layer KV streaming. **The single multi-node instance described in section 5
+below does not actually produce that architecture** — Tensor and Pipeline sharding both
+run every prefill *and* decode step through both nodes' layer ranges. The real
+DGX-prefill/Mac-decode architecture is a separate feature called **Instance Links**
+(prefill/decode disaggregation): two independent single-node instances of the same
+model, linked so the decode node pulls prefill work from the prefill node over TCP,
+streaming KV cache out layer-by-layer as it's computed (`src/exo/worker/engines/mlx/disaggregated/streaming_prefill.py`).
+
+The dashboard's model-launch dialog only exposes the Tensor/Pipeline choice — there is
+no UI option for Instance Links yet. Use the setup script or the API directly.
+
+### Required environment variables
+
+| Variable | Where | Purpose |
+|----------|-------|---------|
+| `ENABLE_DISAGGREGATION=true` | **Both nodes** | Without this, every `/v1/instance-links` endpoint 404s. |
+| `EXO_STREAMING_PREFILL=1` | **Prefill node** (DGX Spark) | Enables layer-by-layer KV streaming during prefill. Without it, disaggregated prefill still works but falls back to computing the whole prefill before sending anything — no compute/network overlap. |
+
+Both are already set in `docker-compose.yml` for the DGX container. On the Mac, export
+them before `uv run exo` (`ENABLE_DISAGGREGATION=true uv run exo` — `EXO_STREAMING_PREFILL`
+only matters on whichever node acts as the prefill server, so it's not needed on the Mac
+when the Mac is the decode node).
+
+### Option A: automated setup script (recommended)
+
+`scripts/setup_disaggregated_cluster.py` drives the whole flow — pins one instance to
+each node (`/instance/previews?node_ids=...`, the only placement endpoint that can
+target a specific node), waits for both to load, links them, and optionally sends a
+test request. Safe to re-run: it reuses any existing instance/link instead of creating
+duplicates.
+
+```bash
+# Run from either node — talks to the cluster over HTTP, no local exo import needed
+# beyond httpx (already a project dependency)
+uv run python scripts/setup_disaggregated_cluster.py \
+  --model mlx-community/Qwen3.6-35B-A3B-bf16 \
+  --prefill-host spark-ams01:52415 \
+  --decode-host moysas-mac-studio:52415 \
+  --test
+```
+
+This assumes the model is already downloaded on both nodes. It prints each step
+(node ID resolution, instance creation, runner status transitions, linking) and fails
+loudly with a specific error if `ENABLE_DISAGGREGATION` isn't set, if a placement has no
+valid single-node option, or if a runner reports `RunnerFailed`.
+
+### Option B: manual API walkthrough
+
+Useful for understanding what the script does, or for debugging a specific step.
+
+```bash
+API=http://localhost:52415   # any node's API — cluster state is shared
+MODEL="mlx-community/Qwen3.6-35B-A3B-bf16"
+
+# 0. Confirm the flag actually took
+curl -s $API/v1/feature-flags   # must show {"disaggregation": true}
+
+# 1. Get node IDs directly from each node (do not guess — hardware identity
+#    strings are unreliable on Linux today, see src/exo/utils/info_gatherer/system_info.py)
+NODE_DGX=$(curl -s http://spark-ams01:52415/node_id | tr -d '"')
+NODE_MAC=$(curl -s http://moysas-mac-studio:52415/node_id | tr -d '"')
+
+# 2. Preview a placement PINNED to each node (the only placement endpoint that
+#    can target a specific node — /place_instance cannot be pinned)
+curl -s "$API/instance/previews?model_id=$MODEL&node_ids=$NODE_DGX" \
+  | jq -c '.previews[] | select(.error==null) | .instance' | head -1 > /tmp/dgx.json
+curl -s "$API/instance/previews?model_id=$MODEL&node_ids=$NODE_MAC" \
+  | jq -c '.previews[] | select(.error==null) | .instance' | head -1 > /tmp/mac.json
+
+# 3. Create both instances verbatim from the previews
+curl -X POST $API/instance -H 'Content-Type: application/json' \
+  -d "{\"instance\": $(cat /tmp/dgx.json)}"
+curl -X POST $API/instance -H 'Content-Type: application/json' \
+  -d "{\"instance\": $(cat /tmp/mac.json)}"
+
+# 4. Wait for both, then find their instance IDs by matching node ID
+curl -N "$API/instance/await?model_id=$MODEL"
+curl -s $API/state | jq '.instances[] | {id: .instanceId, nodes: (.shardAssignments.nodeToRunner | keys)}'
+# Set from the output above:
+PREFILL_ID="<instance id whose nodes includes $NODE_DGX>"
+DECODE_ID="<instance id whose nodes includes $NODE_MAC>"
+
+# 5. Link them: DGX instance = prefill source, Mac instance = decode target
+curl -X POST $API/v1/instance-links -H 'Content-Type: application/json' \
+  -d "{\"prefill_instances\": [\"$PREFILL_ID\"], \"decode_instances\": [\"$DECODE_ID\"]}"
+
+# 6. Run inference — routing to the decode instance and pulling prefill from
+#    the linked DGX instance is fully automatic based on model_id
+curl -N -X POST $API/v1/chat/completions -H 'Content-Type: application/json' \
+  -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"stream\": true}"
+```
+
+Request-body fields are snake_case (`prefill_instances`, `model_id`); response fields
+on `/state`, `/instance/previews`'s nested `.instance`, and `/v1/instance-links` GET
+responses come back camelCase (`shardAssignments`, `nodeToRunner`, `prefillInstances`).
+Always copy the `.instance` object from a preview verbatim into the create call rather
+than hand-writing it.
+
+### Verifying streaming is actually active
+
+`EXO_STREAMING_PREFILL=1` being set doesn't guarantee every layer streams early — an
+unsupported layer/cache shape silently falls back to the final flush (still correct,
+just without the overlap benefit for that layer). To confirm real streaming:
+
+- Tail the **prefill node's** logs during a request with a long-ish prompt (short
+  prompts finish before there's much to observe). You should see multiple `KVChunk`
+  sends interleaved with prefill progress, not one burst at the very end.
+- If `_StreamingKVLayer`'s defensive catch fires for a layer, it logs at `debug` level:
+  `"Streaming prefill: layer N hook failed, will fall back to non-streamed send"` —
+  run with `-vv` to see these.
+- Compare total request latency with `EXO_STREAMING_PREFILL` unset vs `=1` for the same
+  prompt — streaming should win once the prompt is long enough that DGX compute time and
+  KV transfer time are both significant (short prompts won't show much difference).
+
+---
+
+## 5. Running a Model (Single Multi-Node Instance)
+
+This is the simpler default path — one instance spanning both nodes, chosen via the
+dashboard's Tensor/Pipeline toggle or the placement API. **It does not give DGX-prefill/
+Mac-decode specialization** (see section 4 above for that). Pipeline is still
+meaningfully better than Tensor here: Tensor requires an all-reduce sync at every layer
+for both prefill and decode; Pipeline only crosses the network once per forward pass, at
+the single boundary between each node's layer range.
 
 ### Via the dashboard (simplest)
 
@@ -256,7 +382,97 @@ Look for `start_layer` / `end_layer` in the shard metadata to confirm the model 
 
 ---
 
-## 5. Understanding What Happened
+## 6. Testing
+
+Two independent things to verify: the code changes type-check/lint/pass their unit
+tests (works on either platform, no cluster needed), and the live 2-node cluster
+actually streams disaggregated prefill correctly (needs both nodes up).
+
+### Unit tests — on the Mac (native MLX)
+
+`mlx` is only installable on macOS/Apple Silicon or Linux+CUDA — it cannot be tested in
+a plain Linux CPU sandbox, so this must run on real hardware.
+
+```bash
+cd ~/exo   # the audiohacking/exo checkout
+git fetch origin && git checkout feature/linux-cuda-support && git pull
+
+# Dashboard must be built or the whole suite fails to import
+# (find_dashboard() raises FileNotFoundError otherwise)
+cd dashboard && npm install && npm run build && cd ..
+
+# Full suite (excludes slow/network/multi-process tests by default)
+uv run pytest
+
+# Just the streaming-prefill-specific tests, faster:
+uv run pytest \
+  src/exo/worker/tests/unittests/test_runner/test_serve_prefill.py \
+  src/exo/worker/tests/unittests/test_runner/test_streaming_prefill.py \
+  src/exo/worker/engines/mlx/disaggregated/tests/ \
+  -v
+
+# Required pre-commit checks
+uv run basedpyright
+uv run ruff check
+nix fmt
+```
+
+What each file covers:
+
+| File | Covers |
+|------|--------|
+| `disaggregated/tests/test_streaming_prefill.py` | `StreamingPrefillLayers` — fires the per-layer callback correctly, restores original layers on exit (including on exception), skips gracefully for layers with no `cache` kwarg |
+| `test_runner/test_streaming_prefill.py` | `_serve_prefill_streaming`'s wire orchestration — one `KVChunk` per layer as it streams, the final-flush fallback when `on_layer_ready` never fires, `ArraysCache`/SSM state sent exactly once, `EXO_STREAMING_PREFILL` env var parsing, and `_serve_prefill` routing to the streaming vs. bulk path |
+| `test_runner/test_serve_prefill.py` | The pre-existing bulk (non-streaming) path — unchanged behavior, since `on_layer_ready` defaults to `None` |
+| `disaggregated/tests/test_mlx_adapter.py` | `build_kv_chunk_for_entry`/`send_arrays_cache_entry` — the functions extracted from `send_mlx_kv_cache` during the refactor; confirms it's behavior-preserving |
+| `disaggregated/tests/test_end_to_end.py` (marked `@pytest.mark.slow`) | Real `PrefillServer`/socket round-trip — run with `uv run pytest -m ""` to include it |
+
+These tests mock `run_prefill_for_request`/`mlx_prefill` rather than loading a real
+model, so they run in a couple seconds and don't need a downloaded model or a second
+node — they verify the orchestration logic (chunking, threading, wire format), not
+inference correctness.
+
+### Unit tests — on the DGX Spark (CUDA/Linux)
+
+Same commands, but run **inside the container** where `mlx-cuda13` is installed (the
+host Linux Python environment doesn't have `mlx` at all):
+
+```bash
+docker compose build   # picks up any source changes
+docker compose run --rm exo bash
+
+# now inside the container:
+cd /app
+uv run pytest src/exo/worker/tests/unittests/test_runner/test_streaming_prefill.py \
+  src/exo/worker/engines/mlx/disaggregated/tests/ -v
+```
+
+The tests themselves are backend-agnostic (they use plain `KVCache`/`ArraysCache`
+objects, not real CUDA/Metal tensors), so the same test files validate the logic on
+both platforms — there's no CUDA-specific or Metal-specific test variant needed.
+
+### Live end-to-end test (both nodes up)
+
+Unit tests validate the orchestration logic in isolation; they don't prove the two real
+nodes actually stream KV cache to each other correctly. For that, run the cluster:
+
+1. Confirm `ENABLE_DISAGGREGATION=true` on both nodes and `EXO_STREAMING_PREFILL=1` on
+   the DGX container (see section 4), then start both nodes and confirm they've
+   discovered each other (section 3).
+2. Run `scripts/setup_disaggregated_cluster.py --test` (section 4, Option A) — the
+   `--test` flag sends a real chat completion once linked and prints the streamed
+   response.
+3. Tail the DGX container's logs during that request and confirm `KVChunk` sends are
+   interleaved with prefill progress rather than arriving in one burst — see "Verifying
+   streaming is actually active" in section 4.
+4. For a real performance comparison, run the same prompt twice — once with
+   `EXO_STREAMING_PREFILL` unset (bulk path) and once with it set to `1` — using a
+   long enough prompt that DGX compute time and KV transfer time are both significant.
+   Short prompts won't show a meaningful difference.
+
+---
+
+## 7. Understanding What Happened (Single Multi-Node Instance)
 
 ### Placement decision
 
@@ -294,7 +510,7 @@ For a 2-node pipeline, layers are split proportionally to available RAM via `all
 
 ---
 
-## 6. Troubleshooting
+## 8. Troubleshooting
 
 ### Model fails to load
 
@@ -321,7 +537,7 @@ For a 2-node pipeline, layers are split proportionally to available RAM via `all
 
 ---
 
-## 7. Reference
+## 9. Reference
 
 ### Ports
 
@@ -339,6 +555,8 @@ For a 2-node pipeline, layers are split proportionally to available RAM via `all
 | `EXO_ZENOH_NAMESPACE` | Cluster namespace (default: exo version string) |
 | `EXO_MODELS_DIRS` | Model download directories (colon-separated) |
 | `EXO_OFFLINE` | Skip internet checks (`true`/`false`) |
+| `ENABLE_DISAGGREGATION` | Enables `/v1/instance-links` (prefill/decode disaggregation) — required on both nodes for section 4 |
+| `EXO_STREAMING_PREFILL` | Enables layer-by-layer KV streaming during prefill — set on the prefill node only |
 | `MLX_HOSTS_JSON` | MLX ring host configuration (set automatically) |
 | `MLX_RANK` | MLX distributed rank (set automatically) |
 | `MLX_CUDA_RANKS` | Comma-separated CUDA ranks (set automatically) |
