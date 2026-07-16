@@ -132,12 +132,19 @@ async def create_pinned_instance(
 
 async def runner_status_for(
     client: httpx.AsyncClient, api: str, instance_id: str, node_id: str
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
+    """Returns None if the instance or its runner hasn't shown up in /state yet —
+    there's a brief window right after POST /instance where the instance exists but
+    its runner entry doesn't, so callers should treat None as "still starting"."""
     state = await get_json(client, api, "/state")
-    instance = state["instances"][instance_id]
+    instance = state["instances"].get(instance_id)
+    if instance is None:
+        return None
     inner = next(iter(instance.values()))
-    runner_id = inner["shardAssignments"]["nodeToRunner"][node_id]
-    return state["runners"][runner_id]
+    runner_id = inner["shardAssignments"]["nodeToRunner"].get(node_id)
+    if runner_id is None:
+        return None
+    return state["runners"].get(runner_id)
 
 
 async def wait_for_ready(
@@ -152,10 +159,17 @@ async def wait_for_ready(
     last_kind: str | None = None
     while time.monotonic() < deadline:
         status = await runner_status_for(client, api, instance_id, node_id)
-        kind = next(iter(status.keys()))
+        kind = (
+            "(runner not registered yet)"
+            if status is None
+            else next(iter(status.keys()))
+        )
         if kind != last_kind:
             print(f"  [{label}] runner status: {kind}")
             last_kind = kind
+        if status is None:
+            await asyncio.sleep(2.0)
+            continue
         if kind == "RunnerFailed":
             raise SetupError(f"[{label}] runner failed: {status[kind]}")
         if kind in ("RunnerReady", "RunnerRunning"):
