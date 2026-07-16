@@ -144,7 +144,11 @@ The `docker-compose.yml` config:
 |---------|---------|
 | `network_mode: host` | Shares the host network so zenoh discovery and TcpRelay ports work directly |
 | `deploy.resources.reservations.devices` | Exposes the GPU via the NVIDIA Container Toolkit |
-| Volume mounts | Maps `~/.local/share/exo`, `~/.cache/exo`, `~/.config/exo`, `~/.cache/huggingface` into the container |
+| Volume mounts | Maps `~/.local/share/exo`, `~/.cache/exo`, `~/.cache/huggingface` into the container (NOT `~/.config/exo` — avoids sharing the Mac's keypair/identity) |
+| `EXO_ZENOH_NAMESPACE` | Cluster namespace — must match the Mac node's namespace (e.g., `qxip`) |
+| `EXO_ZENOH_PEERS` | Explicit peer addresses for non-multicast networks like Tailscale (e.g., `moysas-mac-studio:52414`) |
+
+**Note:** When machines are on the same physical network, mDNS discovery works automatically and `EXO_ZENOH_PEERS` is not needed. Use it only when discovery fails (e.g., across Tailscale, which doesn't forward multicast).
 
 **Verify:** Check the logs for:
 
@@ -179,8 +183,9 @@ Open `http://localhost:52415/` on either node. The cluster view should show both
 
 | Problem | Fix |
 |---------|-----|
-| Nodes don't discover each other | Verify both are on the same subnet; check firewall allows UDP 52413 and TCP 52414 |
-| Namespace mismatch | Check startup logs for `EXO_ZENOH_NAMESPACE` — both must match |
+| Nodes don't discover each other (same network) | Verify both are on the same subnet; check firewall allows UDP 52413 and TCP 52414 |
+| Nodes don't discover each other (Tailscale) | Tailscale doesn't forward multicast. Set `EXO_ZENOH_PEERS=mac-hostname:52414` in the container's environment |
+| Namespace mismatch | Check startup logs for `EXO_ZENOH_NAMESPACE` — both must match exactly. Set `EXO_ZENOH_NAMESPACE=qxip` (or your namespace) on both nodes |
 | DGX Spark started first | It may have elected itself master. This is fine — the Mac will connect as a worker. Use `--force-master` on the Mac if you want it to be master. |
 | Docker not finding GPU | Verify `docker run --rm --gpus all nvidia/cuda:13.0.2-base-ubuntu24.04 nvidia-smi` works |
 

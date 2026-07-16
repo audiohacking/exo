@@ -17,9 +17,13 @@ services:
       - ~/.local/share/exo:/root/.local/share/exo
       # Exo cache (logs, temporary files)
       - ~/.cache/exo:/root/.cache/exo
-      # Exo config (keypair, settings)
-      - ~/.config/exo:/root/.config/exo
+      # Exo config — NOT mounted to avoid sharing the Mac's keypair/identity.
+      # The container generates its own node ID in /root/.config/exo/.
       # HuggingFace cache (model downloads)
       - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      # Cluster namespace — must match the Mac node
+      - EXO_ZENOH_NAMESPACE=qxip-cluster
+      # - EXO_LIBP2P_NAMESPACE=qxip
     stdin_open: true
     tty: true

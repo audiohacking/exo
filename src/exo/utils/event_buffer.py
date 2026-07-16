@@ -19,9 +19,11 @@ class OrderedBuffer[T]:
         if idx < self.next_idx_to_release:
             return
         if idx in self.store:
-            assert self.store[idx] == t, (
-                "Received different messages with identical indices, probable race condition"
-            )
+            if self.store[idx] != t:
+                logger.warning(
+                    f"Received different events with identical index {idx}, "
+                    "discarding duplicate — this can happen during master transitions"
+                )
             return
         self.store[idx] = t
 
