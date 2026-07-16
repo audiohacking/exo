@@ -14,6 +14,7 @@ DGX Spark (compute-bound prefill)  →  KV cache stream  →  Mac Studio (memory
 - **Prefill** (processing the prompt) is compute-bound → runs on the DGX Spark
 - **Decode** (generating tokens one-by-one) is memory-bound → runs on the Mac Studio
 - KV cache is streamed **layer-by-layer**, overlapping communication with computation to hide network latency
+- A **10 GbE** (or faster) direct or switched connection between the two machines is essential — the KV cache transfer rate is the interconnect bandwidth
 
 ## Benchmarks
 
@@ -35,7 +36,7 @@ DGX Spark (compute-bound prefill)  →  KV cache stream  →  Mac Studio (memory
 |--------|-------|
 | **Mac Studio** | M3 Ultra chip, macOS 15.x+, Ethernet or Thunderbolt networking |
 | **NVIDIA DGX Spark** | 128 GB RAM, ARM64 (aarch64), NVIDIA GPU with CUDA 13.0 support |
-| **Network** | Both machines on the same LAN (same subnet). Ethernet recommended. |
+| **Network** | Direct 10 GbE or switched 10 GbE between the two machines. **This is critical.** The KV cache is streamed layer-by-layer between nodes during inference — any bottleneck on the interconnect directly limits end-to-end throughput. Wi-Fi or 1 GbE will not produce the expected results. |
 
 ### Software on Mac Studio
 
@@ -298,7 +299,7 @@ For a 2-node pipeline, layers are split proportionally to available RAM via `all
 
 ### Slow performance
 
-- Ethernet is strongly recommended — Wi-Fi adds KV cache transfer latency
+- **Network speed is the #1 factor.** A direct 10 GbE or switched 10 GbE link between the Mac and DGX is required. Wi-Fi or 1 GbE will bottleneck the KV cache transfer and eliminate the speedup.
 - Verify both nodes are connected in the dashboard
 - Check shard assignments in `/state` to confirm the model is split across both nodes
 
