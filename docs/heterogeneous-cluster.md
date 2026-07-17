@@ -425,6 +425,11 @@ git fetch origin && git checkout feature/linux-cuda-support && git pull
 # (find_dashboard() raises FileNotFoundError otherwise)
 cd dashboard && npm install && npm run build && cd ..
 
+# Sync deps WITH the mlx extra. A plain `uv sync` is exact and will
+# UNINSTALL mlx/mlx-lm/mlx-vlm (they live in the optional `mlx` extra) —
+# if that happens, this command restores them.
+uv sync --extra mlx
+
 # Full suite (excludes slow/network/multi-process tests by default)
 uv run pytest
 
