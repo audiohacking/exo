@@ -27,6 +27,17 @@ dependencies = [
   "zstandard>=0.23.0",
   "transformers>=5.6.2",
   "python-daemon>=3.1.2",
+  # MLX stack as base dependencies on macOS so a plain `uv sync` / `uv run`
+  # satisfies everything automatically (no --extra mlx needed). Linux gets the
+  # equivalent stack explicitly via the mlx-cpu / mlx-cuda12 / mlx-cuda13
+  # extras, which the darwin markers below leave untouched.
+  "mlx==0.32.0; sys_platform == 'darwin'",
+  "mlx-lm; sys_platform == 'darwin'",
+  "mlx-vlm>=0.5.0; sys_platform == 'darwin'",
+  "mflux==0.17.5; sys_platform == 'darwin'",
+  "torch==2.10.0; sys_platform == 'darwin'",
+  "torchaudio==2.10.0; sys_platform == 'darwin'",
+  "torchvision==0.25.0; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
