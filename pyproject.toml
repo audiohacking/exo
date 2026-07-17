@@ -36,6 +36,7 @@ exo = "exo.main:main"
 [dependency-groups]
 dev = [
   "basedpyright>=1.29.0",
+  "exo-tools",
   "pyinstaller>=6.17.0",
   "playwright>=1.52.0",
   "pytest>=8.4.0",
@@ -80,6 +81,7 @@ members = ["rust/exo_rs", "bench", "tools"]
 
 [tool.uv.sources]
 exo-rs = { workspace = true }
+exo-tools = { workspace = true }
 mlx = [
   { git = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv.git", branch = "address-rdma-gpu-locks", marker = "sys_platform == 'darwin'" },
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx-0.32.0-cp313-cp313-manylinux_2_35_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },

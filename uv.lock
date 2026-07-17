@@ -488,6 +488,7 @@ mlx-none = [
 [package.dev-dependencies]
 dev = [
     { name = "basedpyright" },
+    { name = "exo-tools" },
     { name = "playwright" },
     { name = "pyinstaller" },
     { name = "pytest" },
@@ -560,6 +561,7 @@ provides-extras = ["build", "mlx-none", "mlx", "mlx-cpu", "mlx-cuda12", "mlx-cud
 [package.metadata.requires-dev]
 dev = [
     { name = "basedpyright", specifier = ">=1.29.0" },
+    { name = "exo-tools", editable = "tools" },
     { name = "playwright", specifier = ">=1.52.0" },
     { name = "pyinstaller", specifier = ">=6.17.0" },
     { name = "pytest", specifier = ">=8.4.0" },
