@@ -4,9 +4,10 @@ import re
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast, final
 
 if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import VisionProcessor
@@ -27,7 +28,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-from exo.shared.models.model_cards import ModelId
+from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.worker.engines.mlx.constants import TRUST_REMOTE_CODE
 
 try:
@@ -41,7 +42,7 @@ import mlx.nn as nn
 from mlx_lm.utils import load_model
 from pydantic import RootModel
 
-from exo.download.download_utils import build_model_path
+from exo.download.download_utils import build_model_path, resolve_existing_model
 from exo.shared.types.common import Host
 from exo.shared.types.memory import Memory
 from exo.shared.types.tasks import TaskId, TextGeneration
@@ -65,6 +66,9 @@ from exo.worker.engines.mlx.auto_parallel import (
     tensor_auto_parallel,
 )
 from exo.worker.engines.mlx.types import Model
+from exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks import (
+    DFlashHooksNotImplementedError as _DFlashHooksNotImplementedError,
+)
 from exo.worker.runner.bootstrap import logger
 
 
@@ -122,14 +126,23 @@ def mlx_distributed_init(
 
                 # Eagerly start TcpRelay server on CUDA nodes
                 import platform
-                is_linux_gpu = platform.system() == "Linux" and mx.default_device().type == mx.DeviceType.gpu
-                logger.info(f"CUDA check: os={platform.system()}, device={mx.default_device()}, is_linux_gpu={is_linux_gpu}")
+
+                is_linux_gpu = (
+                    platform.system() == "Linux"
+                    and mx.default_device().type == mx.DeviceType.gpu
+                )
+                logger.info(
+                    f"CUDA check: os={platform.system()}, device={mx.default_device()}, is_linux_gpu={is_linux_gpu}"
+                )
                 if is_linux_gpu:
                     try:
                         from exo.worker.engines.mlx.auto_parallel import _get_tcp_relay
+
                         relay = _get_tcp_relay()
                         relay._ensure_server()
-                        logger.info(f"CUDA TcpRelay server started on port {relay._tcp_port}")
+                        logger.info(
+                            f"CUDA TcpRelay server started on port {relay._tcp_port}"
+                        )
                     except Exception as e:
                         logger.error(f"Failed to start TcpRelay: {e}")
 
@@ -178,9 +191,40 @@ def load_mlx_items(
     bound_instance: BoundInstance,
     group: mx.distributed.Group | None,
 ) -> Generator[
-    ModelLoadingResponse, None, tuple[Model, TokenizerWrapper, "VisionProcessor | None"]
+    ModelLoadingResponse,
+    None,
+    tuple[
+        Model,
+        TokenizerWrapper,
+        "VisionProcessor | None",
+        Model | None,
+        ModelId | None,
+        "CoupledDrafter | None",
+    ],
 ]:
-    set_wired_limit_for_model(get_weights_size(bound_instance.bound_shard))
+    target_card = bound_instance.bound_shard.model_card
+    target_size = get_weights_size(bound_instance.bound_shard)
+
+    # Pre-include drafter size in the wired-memory limit so the OS doesn't
+    # page out drafter weights between requests. The limit is configured once,
+    # before loading the target, so the decision has to happen here.
+    drafter_bytes = 0
+    if not _drafter_disabled_by_env():
+        if target_card.coupled_drafter is not None:
+            drafter_bytes = _coupled_drafter_weight_size_bytes(
+                target_card.coupled_drafter
+            )
+        elif group is None and target_card.drafter_model_ids:
+            chosen = _select_drafter_id(
+                list(target_card.drafter_model_ids), _drafter_preference()
+            )
+            if chosen is not None:
+                drafter_bytes = _drafter_weight_size_bytes(chosen)
+    set_wired_limit_for_model(target_size + Memory.from_bytes(drafter_bytes))
+
+    drafter_model: Model | None = None
+    drafter_id: ModelId | None = None
+    coupled_drafter: CoupledDrafter | None = None
 
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
@@ -204,6 +248,10 @@ def load_mlx_items(
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
 
+        coupled_drafter, drafter_id, drafter_model = _try_load_collocated_drafter(
+            target_card, model, allow_standard_drafter_fallback=True
+        )
+
     else:
         logger.info("Starting distributed init")
         start_time = time.perf_counter()
@@ -214,6 +262,15 @@ def load_mlx_items(
         end_time = time.perf_counter()
         logger.info(
             f"Time taken to shard and load model: {(end_time - start_time):.2f}s"
+        )
+
+        # Symmetric multi-rank (tensor-parallel) placements reach the same
+        # coupled-drafter loader as single-device: each rank replicates the
+        # small coupled drafter and consumes the post-all-reduce hidden state
+        # locally. Standard external drafters can't dispatch through a group,
+        # so no fallback here.
+        coupled_drafter, drafter_id, drafter_model = _try_load_collocated_drafter(
+            target_card, model, allow_standard_drafter_fallback=False
         )
 
     mx.clear_cache()
@@ -240,7 +297,14 @@ def load_mlx_items(
     else:
         vision_processor = None
 
-    return cast(Model, model), tokenizer, vision_processor
+    return (
+        cast(Model, model),
+        tokenizer,
+        vision_processor,
+        drafter_model,
+        drafter_id,
+        coupled_drafter,
+    )
 
 
 def shard_and_load(
@@ -279,11 +343,15 @@ def shard_and_load(
     import platform as _plat
     import socket as _sock
     import struct as _struct
-    _is_cuda = _plat.system() == "Linux" and mx.default_device().type == mx.DeviceType.gpu
+
+    _is_cuda = (
+        _plat.system() == "Linux" and mx.default_device().type == mx.DeviceType.gpu
+    )
     _cuda_ranks = []
     if _is_cuda:
         hosts_json = os.environ.get("MLX_HOSTS_JSON", "[]")
         import json as _json
+
         _hosts = _json.loads(hosts_json)
         _my_rank = int(os.environ.get("MLX_RANK", "0"))
         for i, h in enumerate(_hosts):
@@ -297,7 +365,9 @@ def shard_and_load(
                 s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
                 s.settimeout(2.0)
                 s.connect((ip, peer_port))
-                s.setsockopt(_sock.SOL_SOCKET, _sock.SO_LINGER, _struct.pack("ii", 1, 0))
+                s.setsockopt(
+                    _sock.SOL_SOCKET, _sock.SO_LINGER, _struct.pack("ii", 1, 0)
+                )
                 s.close()
                 _cuda_ranks.append(str(i))
             except Exception:
@@ -974,3 +1044,776 @@ def mx_all_gather_tasks(
     agreed = [local_tasks[tid] for tid in sorted(agreed_ids)]
     different = [task for task in tasks if task.task_id not in agreed_ids]
     return agreed, different
+
+
+@final
+@dataclass(frozen=True)
+class TargetPeerFanout:
+    """Direct TCP int-broadcast wire between target rank 0 and its peers.
+
+    Replaces :func:`mx.distributed.send` / :func:`recv` on the
+    spec-decode hot path. JACCL on Apple Silicon conflates int32
+    broadcasts on the target group with the model's float32 TP
+    ``all_sum`` collectives; the former occasionally returns the
+    latter's logit memory reinterpreted as int32, surfacing as
+    out-of-vocab token ids (~``10^9``) deep in the SPM detokenizer.
+
+    The model's TP ``all_sum`` collectives stay on JACCL/RDMA -- they
+    carry multi-MB tensor reductions where vendor RDMA wins
+    decisively. Only the tiny (~24-byte) int32 broadcasts move to TCP,
+    where Thunderbolt with ``TCP_NODELAY`` adds <100µs per round
+    (negligible against a ~30ms verifier forward).
+
+    Topology:
+      * On target rank 0: ``peer_sockets`` holds one connection per
+        non-zero peer rank, indexed by peer rank.
+      * On a peer target rank (rank > 0): ``rank_zero_socket`` holds
+        the single connection back to rank 0.
+
+    Both shapes are produced by :func:`_setup_target_peer_fanout` at
+    instance bootstrap and are immutable for the runner's lifetime.
+    Reconnect-on-failure is intentionally NOT supported: a transport
+    failure on this wire is treated as a hard runner failure (same as
+    a TP all-reduce failure) and the supervisor rebuilds the instance.
+    """
+
+    rank: int
+    """Caller's target rank inside the parent group; matches
+    ``MlxGroupSplit.parent.rank()`` when ``parent`` is set."""
+
+    peer_sockets: dict[int, object] = field(default_factory=dict)
+    """Rank 0 only: ``{peer_rank: socket.socket}``. Empty on rank > 0."""
+
+    rank_zero_socket: object | None = None
+    """Rank > 0 only: connected socket back to rank 0. ``None`` on rank 0."""
+
+    expected_world_size: int = 1
+    """Target world size (every rank in the fanout sees the same value).
+
+    Stored explicitly so the broadcast helpers can sanity-check that
+    rank 0's ``peer_sockets`` cover all peers without re-deriving the
+    world size from a possibly-discarded group handle."""
+
+
+_MX_BROADCAST_MAX_VALUE: Final[int] = (1 << 31) - 1
+# Toggle to dump every broadcast call's send/recv buffers. Set via
+# ``EXO_PROBE_BROADCAST=1`` for ad-hoc diagnostics; leave off in
+# steady state because the per-token logging spam quickly dominates.
+_BROADCAST_PROBE: Final[bool] = bool(os.environ.get("EXO_PROBE_BROADCAST"))
+
+
+# Distributed backend literal -- matches the strings we pass to
+# ``mx.distributed.init(backend=...)`` in :func:`mlx_distributed_init`.
+DistributedBackend = Literal["ring", "jaccl"]
+
+
+def _detect_distributed_backend() -> DistributedBackend:
+    """Resolve the active MLX distributed backend from the env vars
+    set by :func:`mlx_distributed_init`.
+
+    Why env-var sniffing instead of asking the group: ``mx.distributed.Group``
+    only exposes ``rank()`` / ``size()`` / ``split()`` and gives no
+    public hook for the backend name. We control the init path
+    (:func:`mlx_distributed_init`) and set ``MLX_HOSTFILE`` for ring
+    and ``MLX_IBV_DEVICES`` (plus ``MLX_JACCL_COORDINATOR``) for
+    jaccl, so checking those env vars is a deterministic, in-process
+    signal that doesn't require threading a backend literal through
+    every call site.
+
+    Backend selection matters because the ring backend is built around
+    collective primitives (``all_sum`` / ``all_gather``) and does not
+    support arbitrary point-to-point ``send`` / ``recv`` between
+    non-neighbor ranks; multi-rank ring deployments would fail or
+    hang the moment :func:`mx_broadcast_int_list` issued a
+    ``send(dst=N)`` for a non-neighbor ``N``. JACCL, on the other
+    hand, supports arbitrary ``send`` / ``recv`` and we deliberately
+    use that to keep int32 broadcasts off the same all-reduce wire as
+    TP float32 collectives (see the docstring on
+    :func:`mx_broadcast_int_list` for the historical wire-conflation
+    bug).
+
+    Returns:
+      ``"ring"`` when ``MLX_HOSTFILE`` is set, else ``"jaccl"``.
+      Defaults to ``"ring"`` when neither marker is present so the
+      ring-safe code path runs in ambiguous setups (e.g. tests that
+      construct a fake group without going through
+      :func:`mlx_distributed_init`).
+
+    Raises:
+      None. Detection is best-effort by design: the caller already
+      gated multi-rank entry on ``group is not None``, and a
+      misdetected backend at most picks the slower-but-correct
+      collective path.
+    """
+    if os.environ.get("MLX_HOSTFILE"):
+        return "ring"
+    if os.environ.get("MLX_IBV_DEVICES") or os.environ.get("MLX_JACCL_COORDINATOR"):
+        return "jaccl"
+    return "ring"
+
+
+def _validate_broadcast_values(values: list[int]) -> None:
+    """Range-check root-side broadcast values.
+
+    Centralised so both the single-rank short-circuit and the multi-
+    rank all-sum path enforce identical contracts. Linear scan; for
+    ``length`` values this is microseconds and runs once per round on
+    the spec-decode hot path -- amortised free against an MLX
+    collective.
+    """
+    for index, value in enumerate(values):
+        if value < 0 or value > _MX_BROADCAST_MAX_VALUE:
+            raise ValueError(
+                f"mx_broadcast_int_list values must be in "
+                f"[0, {_MX_BROADCAST_MAX_VALUE}]; "
+                f"index {index} = {value} is out of range "
+                f"(negatives wrap silently in int32 all-sum; values "
+                f">= 2**31 overflow)"
+            )
+
+
+def mx_broadcast_int_list(
+    values: list[int] | None,
+    length: int,
+    group: mx.distributed.Group | None,
+    *,
+    is_root: bool,
+) -> list[int]:
+    """Broadcast a fixed-length int list from one rank to all peers.
+
+    Backend-aware implementation:
+
+      * ``ring``: use ``all_sum`` of an int32 buffer where non-root
+        ranks contribute zeros and root contributes ``values``. Sum
+        across the group recovers ``values`` element-wise (root's
+        contribution is the only nonzero summand). MLX's ring backend
+        is built around collective primitives and does not support
+        arbitrary point-to-point ``send`` / ``recv`` between
+        non-neighbor ranks, so this is the only ring-safe option.
+      * ``jaccl``: rank-0 fanout via :func:`mx.distributed.send` /
+        :func:`mx.distributed.recv`. Root issues one send to every
+        peer; each peer issues a single matching recv from rank 0.
+
+    Why split by backend: under JACCL the model's TP layers issue
+    ``all_sum`` on the same target group on float32 buffers, every
+    layer, every forward. A previous revision used ``all_sum`` for
+    this broadcast on JACCL too and observed silent corruption on
+    the spec-decode hot path: with >100 in-flight ``all_sum``
+    collectives per round all on the same group, JACCL's pairing
+    logic occasionally matched our int32 "broadcast" on rank A
+    against the model's float32 TP all-reduce on rank B, scrambling
+    the int32 buffer (symptom: token ids ~10^9 emitted by the spec
+    loop, ``IndexError`` deep in the SPM detokenizer). Switching to
+    ``send`` / ``recv`` on JACCL makes this broadcast a different
+    primitive than the TP all-reduce so JACCL has no opportunity to
+    merge them. Ring lacks both the JACCL pairing pitfall and the
+    arbitrary-``send`` capability, so it stays on ``all_sum``.
+
+    Caller note: the spec-decode hot path no longer routes through
+    this function -- it uses :func:`target_peer_broadcast_int_list`
+    over a dedicated TCP fanout (see :class:`TargetPeerFanout`). The
+    only remaining caller is :func:`mx_all_gather_tasks` at admit
+    boundaries, which fires far below TP all-reduce frequency, so
+    even on JACCL the wire-conflation risk is low; the
+    ``send`` / ``recv`` path is kept for defense-in-depth.
+
+    The fixed-length contract means the caller pads to ``length`` on
+    root and both ranks agree on ``length`` ahead of time, which keeps
+    the recv shape (or all_sum buffer shape) known statically.
+
+    Args:
+      values: On root, a list of exactly ``length`` ints to broadcast.
+        Each value must be in ``[0, 2**31 - 1]``. Negative values are
+        rejected explicitly so a stray ``-1`` doesn't silently wrap
+        on the int32 cast and corrupt the broadcast. Ignored on
+        non-root.
+      length: Buffer size, agreed by all ranks. Must be ``>= 1``.
+      group: Distributed group; ``None`` is a single-rank short-circuit
+        that simply returns ``values`` (root-only).
+      is_root: ``True`` on the rank holding the source values; ``False``
+        elsewhere. Exactly one rank in ``group`` must pass ``True``.
+
+    Returns:
+      A list of ``length`` ints identical on every rank in ``group``,
+      equal to root's ``values``.
+
+    Raises:
+      ValueError: ``length`` is non-positive, the root's ``values`` are
+        ``None`` or wrong length, or any root value is out of int32
+        range. These are caller bugs, not runtime conditions.
+    """
+    if length < 1:
+        raise ValueError(f"mx_broadcast_int_list length must be >= 1, got {length}")
+
+    if group is None:
+        if not is_root:
+            raise ValueError(
+                "mx_broadcast_int_list: single-rank short-circuit requires "
+                "is_root=True (only the root has source values)"
+            )
+        if values is None or len(values) != length:
+            raise ValueError(
+                "mx_broadcast_int_list: single-rank call requires "
+                f"values of length {length}, got "
+                f"{None if values is None else len(values)}"
+            )
+        _validate_broadcast_values(values)
+        return list(values)
+
+    group_size = group.size()
+
+    if is_root and (values is None or len(values) != length):
+        raise ValueError(
+            "mx_broadcast_int_list root rank requires values of "
+            f"length {length}, got {None if values is None else len(values)}"
+        )
+    if is_root:
+        # ``cast`` for the type-checker: validated above.
+        _validate_broadcast_values(cast(list[int], values))
+
+    backend = _detect_distributed_backend()
+
+    if backend == "ring":
+        # Ring backend: collective ``all_sum``. Root contributes the
+        # values, every other rank contributes a zero buffer of the
+        # same shape, so the element-wise sum is ``values``. This is
+        # the only ring-safe broadcast primitive (ring rejects
+        # arbitrary point-to-point ``send`` / ``recv`` between
+        # non-neighbor ranks).
+        if is_root:
+            local = mx.array(cast(list[int], values), dtype=mx.int32)
+        else:
+            local = mx.zeros(shape=(length,), dtype=mx.int32)
+        summed = mx.distributed.all_sum(local, group=group)
+        mx.eval(summed)
+        out = [int(v) for v in cast(list[int], summed.tolist())]
+        if _BROADCAST_PROBE:
+            role = "ROOT" if is_root else "PEER"
+            logger.warning(
+                f"mx_broadcast_int_list[ring] {role} recovered {out} (len={length})"
+            )
+        return out
+
+    # JACCL backend: send/recv fanout from rank 0.
+    if is_root:
+        send_buffer = mx.array(cast(list[int], values), dtype=mx.int32)
+        for dst in range(1, group_size):
+            sent = mx.distributed.send(send_buffer, dst=dst, group=group)
+            mx.eval(sent)
+        if _BROADCAST_PROBE:
+            logger.warning(
+                f"mx_broadcast_int_list[jaccl] ROOT sent {values} (len={length})"
+            )
+        return list(cast(list[int], values))
+
+    received = mx.distributed.recv(shape=(length,), dtype=mx.int32, src=0, group=group)
+    mx.eval(received)
+    out = [int(v) for v in cast(list[int], received.tolist())]
+    if _BROADCAST_PROBE:
+        logger.warning(
+            f"mx_broadcast_int_list[jaccl] PEER recvd {out} (expected len={length})"
+        )
+    return out
+
+
+def target_peer_broadcast_int_list(
+    values: list[int] | None,
+    length: int,
+    fanout: TargetPeerFanout,
+    *,
+    is_root: bool,
+) -> list[int]:
+    """Broadcast a fixed-length signed int list over the TCP fanout.
+
+    Drop-in replacement for :func:`mx_broadcast_int_list` on the
+    spec-decode hot path. Same shape contract (``length`` agreed by
+    every rank up front; root passes ``values``, peers pass
+    ``None``); the only difference is that this version rides direct
+    TCP sockets instead of ``mx.distributed.send`` / ``recv``,
+    sidestepping the JACCL int/float wire-conflation bug entirely.
+
+    Wire format (every frame): ``length`` little-endian signed int32
+    values, no header. The peer side knows ``length`` from the same
+    shape contract the caller agreed to.
+
+    Args:
+      values: On root, exactly ``length`` int32-range values to
+        broadcast. Ignored on peers.
+      length: Buffer size, agreed by all ranks. Must be ``>= 1``.
+      fanout: Pre-built fanout from :func:`_maybe_setup_target_peer_fanout`.
+        Carries the per-rank role (rank 0 vs peer) and the connected
+        sockets. Mismatched ``is_root`` vs ``fanout.rank`` is a caller
+        bug and raises :class:`ValueError`.
+      is_root: ``True`` on rank 0, ``False`` elsewhere. Asserted
+        against ``fanout.rank``.
+
+    Returns:
+      A list of ``length`` ints identical on every rank, equal to
+      root's ``values``.
+
+    Raises:
+      ValueError: caller-bug conditions (length, values shape,
+        is_root vs rank mismatch).
+      ConnectionError: a peer closed the socket mid-frame; surfaces
+        as a runner failure for the supervisor to rebuild.
+    """
+    import socket as _socket
+
+    from exo.worker.engines.mlx.generator.target_peer_socket import (
+        recv_int32_frame,
+        send_int32_frame,
+    )
+
+    if length < 1:
+        raise ValueError(
+            f"target_peer_broadcast_int_list length must be >= 1, got {length}"
+        )
+    if is_root != (fanout.rank == 0):
+        raise ValueError(
+            f"target_peer_broadcast_int_list is_root={is_root} disagrees "
+            f"with fanout.rank={fanout.rank}; exactly one rank in the "
+            "fanout must pass is_root=True"
+        )
+    if is_root:
+        if values is None or len(values) != length:
+            raise ValueError(
+                "target_peer_broadcast_int_list root rank requires values "
+                f"of length {length}, got "
+                f"{None if values is None else len(values)}"
+            )
+        for sock in fanout.peer_sockets.values():
+            assert isinstance(sock, _socket.socket)  # narrow object -> socket
+            send_int32_frame(sock, values)
+        return list(values)
+    sock = fanout.rank_zero_socket
+    if sock is None:
+        raise RuntimeError(
+            "target_peer_broadcast_int_list called on peer rank but "
+            "fanout.rank_zero_socket is None; bootstrap must populate it"
+        )
+    assert isinstance(sock, _socket.socket)
+    return recv_int32_frame(sock, length)
+
+
+EXO_DISABLE_DRAFTER_ENV = "EXO_DISABLE_DRAFTER"
+EXO_DRAFTER_PREFERENCE_ENV = "EXO_DRAFTER_PREFERENCE"
+
+# Allowed values for ``EXO_DRAFTER_PREFERENCE``. ``fastest`` picks the first
+# drafter declared on the card (smallest by convention); ``highest_acceptance``
+# picks the last (largest by convention); ``auto`` defaults to ``fastest`` but
+# may be tuned by future heuristics (e.g. observed acceptance rate).
+_DRAFTER_PREFERENCE_VALUES: frozenset[str] = frozenset(
+    {"fastest", "highest_acceptance", "auto"}
+)
+
+
+def _drafter_disabled_by_env() -> bool:
+    return os.environ.get(EXO_DISABLE_DRAFTER_ENV, "").lower() in {"1", "true", "yes"}
+
+
+def _drafter_preference() -> str:
+    raw = os.environ.get(EXO_DRAFTER_PREFERENCE_ENV, "auto").lower()
+    if raw not in _DRAFTER_PREFERENCE_VALUES:
+        logger.warning(
+            f"Unknown {EXO_DRAFTER_PREFERENCE_ENV}={raw!r}, falling back to 'auto'"
+        )
+        return "auto"
+    return raw
+
+
+# Drafter kinds the loader recognises. ``"standard"`` is the existing
+# external-drafter path (independent sibling LM via mlx-lm). ``"mtp"`` and
+# ``"dflash"`` are the coupled-drafter kinds shipped by mlx-vlm 0.5+ that
+# attach to the target architecturally (consume the target's hidden state /
+# KV cache every draft step) and only run on single-node placements.
+CoupledDrafterKind = Literal["mtp", "dflash"]
+_KNOWN_COUPLED_DRAFTER_KINDS: Final[frozenset[CoupledDrafterKind]] = frozenset(
+    {"mtp", "dflash"}
+)
+
+
+@final
+@dataclass(frozen=True, kw_only=True)
+class CoupledDrafter:
+    """A loaded MTP/DFlash-kind coupled drafter, ready for the generator.
+
+    Coupled drafters consume the target's hidden state every draft step and
+    (for ``kind="mtp"``) read the target's KV cache directly via
+    ``set_shared_kv``. They cannot decode independently the way standard
+    external drafters can, so this loader path runs only when the placement
+    collocates target + drafter on the same node (i.e. the target is not
+    asymmetrically split via ``DrafterPlacement`` and the runner is loading
+    both halves locally).
+
+    The model object is typed ``object`` because the concrete class
+    (``Gemma4AssistantDraftModel`` for ``mtp``, ``DFlashDraftModel`` for
+    ``dflash``) lives in mlx-vlm and importing it in the worker hot path
+    would force every linux/CPU build to drag mlx-vlm into the type
+    surface. Generator-side dispatch narrows the type at the use site.
+    """
+
+    model_id: ModelId
+    kind: CoupledDrafterKind
+    model: object
+
+
+# Exceptions :func:`_dispatch_attach_coupled_hooks` may raise that the
+# loader caller should treat as "drafter loaded but not dispatchable on
+# this target -- degrade to standard drafting" rather than crashes:
+#
+# - :class:`TypeError` -- right kind, wrong target architecture (e.g.
+#   card declared a ``coupled_drafter`` of kind ``"mtp"`` but the target
+#   loaded as something other than a Gemma 4 ``Model``).
+# - :class:`exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks.DFlashHooksNotImplementedError`
+#   -- right kind, hooks not yet vendored for that kind. Today raised by
+#   the dflash skeleton; deletion follows the qwen3_5 vendor work.
+#
+# Listed at module scope (rather than caught inline) so the exception
+# tuple stays a single source of truth -- adding a future coupled-drafter
+# kind extends the tuple here once and the loader picks it up automatically.
+# ``_DFlashHooksNotImplementedError`` is imported at the top of the file
+# alongside other vendor imports so ruff E402 stays happy.
+_COUPLED_HOOK_ATTACH_FALLBACK_EXCEPTIONS: tuple[type[Exception], ...] = (
+    TypeError,
+    _DFlashHooksNotImplementedError,
+)
+
+
+def _dispatch_attach_coupled_hooks(kind: CoupledDrafterKind, model: object) -> None:
+    """Mark ``model`` as wired for ``kind``'s coupled-drafter hooks.
+
+    Per-kind dispatcher around the vendor modules' ``attach_*_hooks``
+    helpers. Splitting the dispatch out of the load path lets the
+    loader stay kind-agnostic -- adding a new coupled-drafter kind
+    only requires extending this match plus the vendor module, not
+    touching :func:`load_mlx_items`.
+
+    Raises:
+        TypeError: ``model`` is the wrong target architecture for
+            the declared ``kind``. Caller falls back to standard
+            drafting (see :data:`_COUPLED_HOOK_ATTACH_FALLBACK_EXCEPTIONS`).
+        DFlashHooksNotImplementedError: ``kind == "dflash"`` and the
+            qwen3_5 hook surface is still a skeleton. Same fallback.
+    """
+    match kind:
+        case "mtp":
+            from exo.worker.engines.mlx.vendor.gemma4_mtp_hooks import (
+                attach_mtp_hooks,
+            )
+
+            attach_mtp_hooks(model)
+        case "dflash":
+            from exo.worker.engines.mlx.vendor.qwen3_5_dflash_hooks import (
+                attach_dflash_hooks,
+            )
+
+            attach_dflash_hooks(model)
+
+
+def _coupled_drafter_weight_size_bytes(coupled_id: ModelId) -> int:
+    """Best-effort coupled-drafter on-disk size for the wired-memory bump.
+
+    Mirrors :func:`_drafter_weight_size_bytes`: walk the drafter directory
+    and sum file sizes; return 0 on any error. Coupled drafters are tiny
+    (~158MB for the Gemma 4 E2B assistant) so under-wiring here is cheap
+    even if the helper falls through; we just want a reasonable hint to
+    ``set_wired_limit_for_model`` so the OS doesn't page the drafter
+    weights out between requests.
+    """
+    drafter_path = resolve_existing_model(coupled_id)
+    if drafter_path is None:
+        return 0
+    try:
+        return sum(p.stat().st_size for p in drafter_path.rglob("*") if p.is_file())
+    except OSError:
+        return 0
+
+
+def _try_load_coupled_drafter(model_card: ModelCard) -> CoupledDrafter | None:
+    """Attempt to load the coupled drafter declared on ``model_card``.
+
+    Returns the loaded drafter on success, or ``None`` when:
+    - the card declares no ``coupled_drafter``,
+    - ``EXO_DISABLE_DRAFTER`` is set,
+    - mlx-vlm is unavailable (e.g. linux build without the speculative
+      drafters extra) or too old to expose ``load_drafter``,
+    - the drafter's weights are not on disk,
+    - mlx-vlm resolves an unknown / unsupported drafter kind, or
+    - the load itself raises.
+
+    Failures are logged at warning level and swallowed so that single-node
+    deployments degrade to the standard external-drafter list (or to plain
+    decoding) instead of crashing the runner. The caller is responsible
+    for that fallback.
+    """
+    coupled_id = model_card.coupled_drafter
+    if coupled_id is None:
+        return None
+    if _drafter_disabled_by_env():
+        logger.info(
+            f"Coupled drafter declared by {model_card.model_id} but "
+            f"{EXO_DISABLE_DRAFTER_ENV} is set; skipping coupled drafter load."
+        )
+        return None
+
+    # mlx-vlm's speculative-drafter API is partially typed (its
+    # ``load_drafter`` signature uses ``**kwargs`` with no annotation),
+    # so we cast at the import boundary to give the rest of this
+    # function a well-typed surface. ``KNOWN_DRAFTER_KINDS`` is an
+    # iterable of upstream kind strings -- declared as ``Iterable[str]``
+    # because mlx-vlm uses ``frozenset[str]`` today but a future
+    # release could swap it for a list without breaking us.
+    #
+    # Codex P2 (PR #23 round-(N+0), utils_mlx.py:809): we also catch
+    # ``AttributeError`` so a partial / mismatched mlx-vlm install (the
+    # ``speculative`` package imports cleanly but is missing
+    # ``load_drafter`` / ``KNOWN_DRAFTER_KINDS`` -- e.g. an old release
+    # with the namespace package but pre-drafter API, or a future
+    # release that renames the symbols) degrades to the standard
+    # drafter path instead of crashing the runner.
+    try:
+        from mlx_vlm.speculative import (  # pyright: ignore[reportMissingTypeStubs]
+            drafters as _mlxvlm_drafters,
+        )
+
+        load_drafter = cast(
+            Callable[..., tuple[object, str]],
+            _mlxvlm_drafters.load_drafter,
+        )
+        known_drafter_kinds = cast(
+            "Iterable[str]",
+            _mlxvlm_drafters.KNOWN_DRAFTER_KINDS,
+        )
+    except (ImportError, AttributeError) as exc:
+        logger.warning(
+            f"Coupled drafter declared by {model_card.model_id} requires "
+            f"mlx-vlm with speculative-drafter support (>=0.5.0) exposing "
+            f"``load_drafter`` and ``KNOWN_DRAFTER_KINDS``, but resolving "
+            f"those symbols failed ({type(exc).__name__}: {exc}); falling "
+            f"back to the standard drafter path."
+        )
+        return None
+
+    drafter_path = resolve_existing_model(coupled_id)
+    if drafter_path is None:
+        logger.warning(
+            f"Coupled drafter {coupled_id} declared by {model_card.model_id} "
+            "is not downloaded; pre-download it to enable coupled "
+            "speculative decoding. Falling back to the standard drafter "
+            "path for this load."
+        )
+        return None
+
+    drafter_start = time.perf_counter()
+    try:
+        loaded_model, resolved_kind = load_drafter(str(drafter_path), kind=None)
+    except Exception as exc:
+        logger.opt(exception=exc).warning(
+            f"Failed to load coupled drafter {coupled_id} via mlx-vlm; "
+            "falling back to the standard drafter path."
+        )
+        return None
+
+    if resolved_kind not in _KNOWN_COUPLED_DRAFTER_KINDS:
+        # mlx-vlm may evolve to recognise more kinds before exo's loader
+        # learns to dispatch them; refuse rather than load a model the
+        # generator cannot drive.
+        known_upstream: list[str] = sorted(known_drafter_kinds)
+        logger.warning(
+            f"Coupled drafter {coupled_id} resolved to kind "
+            f"{resolved_kind!r}, which exo's generator does not yet "
+            f"support (known kinds: {sorted(_KNOWN_COUPLED_DRAFTER_KINDS)}; "
+            f"mlx-vlm reports: {known_upstream}). Falling "
+            "back to the standard drafter path."
+        )
+        return None
+
+    logger.info(
+        f"Loaded coupled drafter {coupled_id} (kind={resolved_kind!r}) "
+        f"for {model_card.model_id} in "
+        f"{(time.perf_counter() - drafter_start):.2f}s"
+    )
+    return CoupledDrafter(
+        model_id=coupled_id,
+        kind=resolved_kind,
+        model=loaded_model,
+    )
+
+
+def _select_drafter_id(candidates: list[ModelId], preference: str) -> ModelId | None:
+    """Pick a drafter id from a card's preference-ordered list.
+
+    The card lists drafters in `[fastest, ..., highest_acceptance]` order. We
+    prefer drafters that are already on disk (so the chooser doesn't force a
+    surprise download); within the on-disk subset we honor the user's
+    preference. If nothing is on disk we fall back to the head of the list,
+    leaving the loader to log a "weights missing" warning.
+    """
+    if not candidates:
+        return None
+
+    on_disk = [cid for cid in candidates if resolve_existing_model(cid) is not None]
+    pool = on_disk if on_disk else candidates
+
+    if preference == "highest_acceptance":
+        return pool[-1]
+    return pool[0]
+
+
+def _maybe_load_drafter(model_card: ModelCard) -> tuple[ModelId, Model] | None:
+    """Load a drafter model declared on ``model_card``, if any.
+
+    Returns the chosen ``(drafter_id, drafter_model)`` pair on success, or
+    ``None`` when the card declares no drafter, the chosen drafter's weights
+    are not on disk, ``EXO_DISABLE_DRAFTER`` is set, or the load itself
+    fails. Drafter loading failures are logged and swallowed: the target
+    model continues to load and inference falls back to standard
+    (non-speculative) decoding.
+
+    This helper is intentionally single-device only. Multi-device distributed
+    inference does not pass ``draft_model`` through to ``stream_generate``
+    today (see ``mlx_generate``), so loading a drafter on those ranks would
+    just waste memory.
+    """
+    candidates = list(model_card.drafter_model_ids)
+    if not candidates:
+        return None
+    if _drafter_disabled_by_env():
+        logger.info(
+            f"Drafter declared by {model_card.model_id} but "
+            f"{EXO_DISABLE_DRAFTER_ENV} is set; skipping drafter load."
+        )
+        return None
+
+    preference = _drafter_preference()
+    drafter_id = _select_drafter_id(candidates, preference)
+    if drafter_id is None:
+        return None
+
+    drafter_path = resolve_existing_model(drafter_id)
+    if drafter_path is None:
+        logger.warning(
+            f"Drafter {drafter_id} (preferred '{preference}') declared by "
+            f"{model_card.model_id} is not downloaded; falling back to "
+            "standard decoding. Pre-download the drafter to enable "
+            "speculative decoding."
+        )
+        return None
+
+    drafter_start = time.perf_counter()
+    try:
+        drafter_model, _ = load_model(drafter_path, lazy=True, strict=False)
+        mx.eval(drafter_model)
+    except Exception as exc:
+        logger.opt(exception=exc).warning(
+            f"Failed to load drafter {drafter_id}; continuing without "
+            "speculative decoding."
+        )
+        return None
+    logger.info(
+        f"Loaded drafter {drafter_id} (preferred '{preference}') for "
+        f"{model_card.model_id} in {(time.perf_counter() - drafter_start):.2f}s"
+    )
+    return drafter_id, cast(Model, drafter_model)
+
+
+def _try_load_collocated_drafter(
+    target_card: ModelCard,
+    model: nn.Module,
+    *,
+    allow_standard_drafter_fallback: bool,
+) -> tuple[CoupledDrafter | None, ModelId | None, Model | None]:
+    """Resolve the collocated drafter (coupled or standard) for ``model``.
+
+    Coupled-drafter precedence: when the card declares
+    ``coupled_drafter`` we try it first because it's the path that
+    yields the multi-x DFlash / MTP speedup. If the coupled load
+    fails (mlx-vlm missing, weights absent, kind unrecognised, target
+    type unsupported) we either fall through to the standard
+    external-drafter list (single-device, where the standard drafter
+    *is* dispatchable) or return empty-handed (multi-device, where
+    the generator can't dispatch standard drafters yet so loading
+    one would just waste memory).
+
+    On a successful coupled load we ALSO attach the target-side hooks
+    (``attach_mtp_hooks`` / ``attach_dflash_hooks``). The hook is the
+    *capability gate* that :func:`mlx_generate` reads -- without it,
+    the dispatch declines to route the request through the coupled
+    path and the loaded coupled drafter stays passive. Hook
+    attachment can fail on its own (e.g. the card incorrectly pairs a
+    Gemma 4 ``coupled_drafter`` with a non-Gemma target); we treat
+    that as another degrade-to-standard signal rather than a hard
+    load failure so traffic keeps flowing through whichever drafter
+    path is available.
+
+    Used by both single-device and symmetric multi-rank (tensor-
+    parallel) placements. Tensor parallel works because coupled
+    drafters (~0.5-3 GB) replicate per rank and consume the post-
+    all-reduce hidden state, which is identical on every rank. The
+    drafter's own KV / SSM state replicates with the same logic.
+    Asymmetric multi-rank uses a separate ``DrafterRunner`` reachable
+    over the parent group and is handled by the caller (the
+    ``drafter_placement is not None`` branch).
+
+    Args:
+        target_card: The target model card; supplies the
+            ``coupled_drafter`` and ``drafter_model_ids`` declarations.
+        model: The (possibly sharded) loaded target. Coupled hooks
+            attach to this object's wrapper / inner-text-model
+            sentinel attributes.
+        allow_standard_drafter_fallback: Whether to fall back to
+            :func:`_maybe_load_drafter` when no coupled drafter loads.
+            Pass ``True`` for single-device placements (the standard
+            drafter is dispatchable). Pass ``False`` for multi-device
+            placements -- :func:`mlx_generate` declines to dispatch
+            standard drafters when ``group is not None`` today, so a
+            loaded standard drafter would just sit in memory unused.
+
+    Returns:
+        ``(coupled_drafter, drafter_id, drafter_model)`` where at
+        most one of ``coupled_drafter`` and ``drafter_model`` is
+        non-None. ``drafter_id`` is populated only on a successful
+        standard-drafter load -- coupled-drafter attribution is
+        threaded through ``GenerationStats`` from
+        :data:`CoupledDrafter.model_id` instead, see
+        :func:`_resolve_coupled_drafter_telemetry`.
+    """
+    coupled_drafter = _try_load_coupled_drafter(target_card)
+    if coupled_drafter is not None:
+        try:
+            _dispatch_attach_coupled_hooks(coupled_drafter.kind, model)
+        except _COUPLED_HOOK_ATTACH_FALLBACK_EXCEPTIONS as e:
+            logger.warning(
+                f"Coupled drafter loaded for "
+                f"{target_card.model_id} but target type "
+                f"{type(model).__name__!r} is incompatible "
+                f"with the {coupled_drafter.kind} hooks "
+                f"(error: {e}). Discarding coupled drafter "
+                "and falling back to standard drafting."
+            )
+            coupled_drafter = None
+    if coupled_drafter is not None:
+        return coupled_drafter, None, None
+    if not allow_standard_drafter_fallback:
+        return None, None, None
+    drafter_pair = _maybe_load_drafter(target_card)
+    if drafter_pair is None:
+        return None, None, None
+    drafter_id, drafter_model = drafter_pair
+    return None, drafter_id, drafter_model
+
+
+def _drafter_weight_size_bytes(drafter_id: ModelId) -> int:
+    """Best-effort drafter-on-disk size for the wired-memory bump.
+
+    Walks the drafter directory and sums file sizes. Returns 0 on any error
+    (the drafter weights aren't critical-path so we'd rather under-wire than
+    crash).
+    """
+    drafter_path = resolve_existing_model(drafter_id)
+    if drafter_path is None:
+        return 0
+    try:
+        return sum(p.stat().st_size for p in drafter_path.rglob("*") if p.is_file())
+    except OSError:
+        return 0

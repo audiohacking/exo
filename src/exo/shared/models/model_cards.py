@@ -175,6 +175,14 @@ class ModelCard(FrozenModel):
     is_custom: bool = False
     vision: VisionCardConfig | None = None
     sampling_defaults: SamplingDefaults = Field(default_factory=SamplingDefaults)
+    # Optional speculative-decoding draft models, in preference order. Standard
+    # external drafters: independent small LMs sharing the target's tokenizer.
+    drafter_model_ids: list[ModelId] = Field(default_factory=list)
+    # Optional coupled drafter (Gemma-4 MTP assistant or Qwen3 DFlash). Coupled
+    # drafters consume the target's hidden state each draft step, so they must
+    # be collocated with the target (single-node placements only). Kind is
+    # auto-detected from the drafter's HF model_type at load time.
+    coupled_drafter: ModelId | None = None
 
     @model_validator(mode="after")
     def _autodetect_vision(self) -> "ModelCard":

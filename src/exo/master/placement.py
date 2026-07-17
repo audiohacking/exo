@@ -118,7 +118,8 @@ def _rotate_metal_to_middle(
         return cycle
 
     metal_indices = [
-        i for i, nid in enumerate(cycle)
+        i
+        for i, nid in enumerate(cycle)
         if Backend.MlxMetal in set(node_backends.get(nid, []))
     ]
     if not metal_indices:

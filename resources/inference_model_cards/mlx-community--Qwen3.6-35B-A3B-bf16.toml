@@ -8,6 +8,9 @@ family = "qwen"
 quantization = "bf16"
 base_model = "Qwen3.6 35B A3B"
 capabilities = ["text", "thinking", "thinking_toggle", "vision"]
+# z-lab DFlash block-diffusion drafter (block_size=16); enables coupled
+# speculative decoding on single-node placements when downloaded.
+coupled_drafter = "z-lab/Qwen3.6-35B-A3B-DFlash"
 reasoning_dialect = "post_last_user"
 context_length = 262144
 backends = ["MlxMetal", "MlxCuda", "MlxCpu"]

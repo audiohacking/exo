@@ -96,8 +96,9 @@ async def test_ingest_drops_duplicate_indices(buffer: OrderedBuffer[Event]):
     buffer.ingest(*make_indexed_event(0))
     buffer.ingest(*event2_first)
 
-    with pytest.raises(AssertionError):
-        buffer.ingest(*event2_second)  # This duplicate should be ignored
+    # Conflicting duplicate is discarded with a warning (first one wins) —
+    # raising here crashed the whole node during master transitions.
+    buffer.ingest(*event2_second)
 
     drained = buffer.drain_indexed()
     assert len(drained) == 2

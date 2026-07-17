@@ -78,6 +78,7 @@ _tcp_relay: "TcpRelay | None" = None
 def _is_cuda_device() -> bool:
     """Check if the current MLX device is CUDA (Linux GPU)."""
     import platform
+
     if platform.system() != "Linux":
         return False
     return mx.default_device().type == mx.DeviceType.gpu
@@ -101,7 +102,6 @@ class TcpRelay:
     def __init__(self) -> None:
         import json
         import os
-        import struct as _struct
 
         # The MLX_HOSTFILE may be a deleted tempfile. Try MLX_HOSTS_JSON first.
         hosts_json = os.environ.get("MLX_HOSTS_JSON")
@@ -146,7 +146,9 @@ class TcpRelay:
         # or fallback to self-only (conservative).
         cuda_ranks_str = os.environ.get("MLX_CUDA_RANKS", "")
         if cuda_ranks_str:
-            self._cuda_peers: set[int] = set(int(r) for r in cuda_ranks_str.split(",") if r.strip())
+            self._cuda_peers: set[int] = set(
+                int(r) for r in cuda_ranks_str.split(",") if r.strip()
+            )
         elif self._is_cuda:
             self._cuda_peers = {self.rank}
         else:
@@ -154,9 +156,15 @@ class TcpRelay:
 
         # Dtype serialization maps (built once)
         import numpy as _np
+
         self._DTYPE_TO_CODE = {
-            _np.float32: 0, _np.float16: 1, _np.int32: 2, _np.int64: 3,
-            _np.bool_: 4, _np.uint8: 5, _np.bfloat16: 6,
+            _np.float32: 0,
+            _np.float16: 1,
+            _np.int32: 2,
+            _np.int64: 3,
+            _np.bool_: 4,
+            _np.uint8: 5,
+            _np.bfloat16: 6,
         }
         self._CODE_TO_DTYPE = {v: k for k, v in self._DTYPE_TO_CODE.items()}
 
@@ -200,6 +208,7 @@ class TcpRelay:
         peer_port = self._port_base + dst_rank
 
         import time
+
         last_err = None
         for attempt in range(60):
             try:
@@ -213,9 +222,14 @@ class TcpRelay:
                 sock.close()
                 if attempt == 0 or attempt % 10 == 9:
                     from exo.worker.runner.bootstrap import logger
-                    logger.warning(f"TcpRelay connect({peer_ip}:{peer_port}) attempt {attempt+1}/60: {e}")
+
+                    logger.warning(
+                        f"TcpRelay connect({peer_ip}:{peer_port}) attempt {attempt + 1}/60: {e}"
+                    )
                 time.sleep(1)
-        raise ConnectionError(f"Could not connect to rank {dst_rank} at {peer_ip}:{peer_port}") from last_err
+        raise ConnectionError(
+            f"Could not connect to rank {dst_rank} at {peer_ip}:{peer_port}"
+        ) from last_err
 
     def send(self, x: mx.array, dst: int) -> mx.array:
         """Send array to dst rank via TCP."""
@@ -229,7 +243,9 @@ class TcpRelay:
         dtype_code = self._DTYPE_TO_CODE.get(x_np.dtype.type, 0)
 
         data = x_np.tobytes()
-        header = struct.pack("!IIIQ", len(x_np.shape), dtype_code, x_np.dtype.itemsize, len(data))
+        header = struct.pack(
+            "!IIIQ", len(x_np.shape), dtype_code, x_np.dtype.itemsize, len(data)
+        )
         shape_data = struct.pack(f"!{len(x_np.shape)}I", *x_np.shape)
 
         self._ensure_server()
@@ -249,6 +265,7 @@ class TcpRelay:
             sock = self._connections[src]
         else:
             import time
+
             for attempt in range(120):
                 try:
                     self._server_socket.settimeout(5.0)
@@ -272,10 +289,15 @@ class TcpRelay:
                 except _socket.timeout:
                     if attempt % 10 == 0:
                         from exo.worker.runner.bootstrap import logger
-                        logger.warning(f"TcpRelay accept from rank {src} attempt {attempt+1}/20 timeout")
+
+                        logger.warning(
+                            f"TcpRelay accept from rank {src} attempt {attempt + 1}/20 timeout"
+                        )
                     time.sleep(1)
             else:
-                raise ConnectionError(f"TcpRelay accept from rank {src} timed out after 20 attempts")
+                raise ConnectionError(
+                    f"TcpRelay accept from rank {src} timed out after 20 attempts"
+                )
 
         header = self._recv_exact(sock, 20)
         ndim, dtype_code, itemsize, total = struct.unpack("!IIIQ", header)
@@ -295,8 +317,8 @@ class TcpRelay:
             chunk = sock.recv(min(view.nbytes, 65536))
             if not chunk:
                 raise ConnectionError("Connection closed")
-            view[:len(chunk)] = chunk
-            view = view[len(chunk):]
+            view[: len(chunk)] = chunk
+            view = view[len(chunk) :]
         return bytes(buf)
 
 
@@ -402,16 +424,12 @@ class PipelineLastLayer(CustomMlxLayer):
         if self.r != self.s - 1:
             dst = (self.r + 1) % self.s
             if self.queue_sends:
-                _pending_prefill_sends.append(
-                    (output, dst, self.group)
-                )
+                _pending_prefill_sends.append((output, dst, self.group))
             elif _is_cuda_device() and _get_tcp_relay().is_cuda_to_cuda(dst):
                 relay = _get_tcp_relay()
                 relay.send(output, dst)
             else:
-                output = mx.distributed.send(
-                    output, dst, group=self.group
-                )
+                output = mx.distributed.send(output, dst, group=self.group)
             if cache is not None:
                 _cache = cache[0] if hasattr(cache, "caches") else cache  # type: ignore
                 if hasattr(_cache, "keys"):  # pyright: ignore[reportAny]

@@ -561,7 +561,63 @@ For a 2-node pipeline, layers are split proportionally to available RAM via `all
 
 ---
 
-## 9. Reference
+## 9. Speculative Decoding (DFlash / MTP drafters)
+
+Ported from upstream [PR #2079](https://github.com/exo-explore/exo/pull/2079)
+(collocated drafting only — the asymmetric remote-drafter placement was not
+ported). A model card may declare a **coupled drafter** (`coupled_drafter` in
+the card TOML): a small model that consumes the target's hidden states each
+draft step and proposes token blocks the target verifies in one forward pass.
+Lossless — output is identical to normal decoding. Upstream benchmarked
+Qwen3.6-35B-A3B-8bit + z-lab DFlash at **4.30× decode speedup** (92.6%
+acceptance) on Apple Silicon.
+
+### How it activates
+
+1. The model card declares `coupled_drafter` (already set on the
+   `mlx-community/Qwen3.6-35B-A3B-8bit` and `-bf16` cards — 8bit is the
+   upstream-benchmarked pairing) or `drafter_model_ids` (standard external
+   drafter sharing the target's tokenizer).
+2. The drafter weights must already be on disk — automatic drafter download is
+   NOT ported. Pre-download with:
+   `uv run python scripts/download_model_to_cluster.py z-lab/Qwen3.6-35B-A3B-DFlash --host <node>`
+   If absent, the runner logs a warning and falls back to plain decoding.
+3. On instance load, the runner loads the drafter (coupled drafters via
+   mlx-vlm ≥ 0.5.0), attaches target-side hooks, and selects the
+   SequentialGenerator (the batch engine has no speculative hook).
+4. Verify in logs: `Loaded coupled drafter ... kind='dflash'` and
+   `using SequentialGenerator (coupled drafter loaded: ...)`.
+
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `EXO_DRAFT_MODE` | `model` / `pipelined` / `ngram` / `none` — default `model` when a drafter loaded, else `none` |
+| `EXO_DISABLE_DRAFTER` | `1` skips drafter loading entirely |
+| `EXO_NUM_DRAFT_TOKENS` | Draft block size K (default 5) |
+| `EXO_ADAPTIVE_DRAFT_TOKENS` | `1` adapts K per-round from rolling acceptance |
+| `EXO_DRAFTER_MIN_OUTPUT_TOKENS` | Skip drafting for requests with max_tokens at or below this (default 16) |
+| `EXO_DRAFTER_PREFERENCE` | `fastest` / `highest_acceptance` / `auto` for multi-entry `drafter_model_ids` |
+
+Per-request overrides on `/v1/chat/completions`: `use_drafter`,
+`num_draft_tokens`, `draft_mode`. Telemetry lands in the response's
+`generation_stats` (accepted/proposed draft tokens, acceptance fraction,
+drafter kind).
+
+### Platform notes
+
+- **Mac (Metal)**: the upstream-validated path.
+- **DGX/CUDA**: unproven — the drafter graph runs on the same MLX ops the
+  target uses, so it should execute under `mlx-cuda13`, but correctness must
+  be verified (lossless ⇒ output must match plain decoding byte-for-byte)
+  and speedup re-measured. mlx-vlm must also install against mlx-cuda13.
+- Speculative decoding composes with disaggregated prefill (section 4): the
+  decode node runs the drafter; remote prefill still supplies the KV cache.
+  This combination is also unvalidated — test each feature separately first.
+
+---
+
+## 10. Reference
 
 ### Ports
 
